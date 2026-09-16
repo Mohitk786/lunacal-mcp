@@ -3,6 +3,7 @@ import dotenv from "dotenv";
 import { McpServer, createMcpHandler, type AuthInfo } from "@modelcontextprotocol/server";
 import { toNodeHandler, type NodeIncomingMessageLike } from "@modelcontextprotocol/node";
 import { registerLunacalTools } from "./lunacalTools.js";
+import { getWebappUrl } from "./lunacalApiClient.js";
 import {
     registerMcpClient,
     beginAuthorization,
@@ -18,7 +19,11 @@ const PUBLIC_BASE_URL = process.env.LUNACAL_MCP_PUBLIC_URL ?? `http://localhost:
 const MCP_PATH = "/mcp";
 
 const handler = createMcpHandler((ctx) => {
-    const server = new McpServer({ name: "lunacal", version: "1.0.0" });
+    const server = new McpServer({
+        name: "lunacal",
+        version: "1.0.0",
+        icons: [{ src: `${getWebappUrl()}/lunacal-icon.svg`, mimeType: "image/svg+xml" }],
+    });
     // ctx.authInfo.token, when present, IS the resolved Lunacal access token
     // (see index()'s request handling below and oauthBroker.resolveLunacalAccessToken)
     // — not a token the MCP client can read or forge.

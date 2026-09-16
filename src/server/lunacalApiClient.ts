@@ -9,7 +9,7 @@ export class LunacalApiError extends Error {
     }
 }
 
-function getWebappUrl(): string {
+export function getWebappUrl(): string {
     return process.env.LUNACAL_WEBAPP_URL ?? DEFAULT_WEBAPP_URL;
 }
 

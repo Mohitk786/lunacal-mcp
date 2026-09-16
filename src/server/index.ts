@@ -13,7 +13,7 @@ import {
 
 dotenv.config();
 
-const PORT = Number(process.env.LUNACAL_MCP_PORT ?? 3939);
+const PORT = Number(process.env.PORT ?? process.env.LUNACAL_MCP_PORT ?? 3939);
 const PUBLIC_BASE_URL = process.env.LUNACAL_MCP_PUBLIC_URL ?? `http://localhost:${PORT}`;
 const MCP_PATH = "/mcp";
 
@@ -73,6 +73,16 @@ createServer(async (req, res) => {
             return;
         }
 
+        // --- OAuth Protected Resource Metadata (RFC 9728) ---
+        if (url.pathname === "/.well-known/oauth-protected-resource") {
+            sendJson(res, 200, {
+                resource: `${PUBLIC_BASE_URL}/mcp`,
+                authorization_servers: [PUBLIC_BASE_URL],
+                bearer_methods_supported: ["header"],
+            });
+            return;
+        }
+
         // --- RFC 7591 dynamic client registration ---
         if (url.pathname === "/register" && req.method === "POST") {
             const body = await readJsonBody(req);
@@ -121,7 +131,16 @@ createServer(async (req, res) => {
 
             const lunacalToken = bearerToken ? resolveLunacalAccessToken(bearerToken) : undefined;
             if (!lunacalToken) {
-                sendJson(res, 401, { error: "invalid_token" });
+                res.writeHead(401, {
+                    "Content-Type": "application/json",
+                    "WWW-Authenticate":
+                        `Bearer resource_metadata="${PUBLIC_BASE_URL}/.well-known/oauth-protected-resource"`,
+                });
+            
+                res.end(JSON.stringify({
+                    error: "invalid_token",
+                }));
+            
                 return;
             }
 

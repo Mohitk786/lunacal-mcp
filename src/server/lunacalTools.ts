@@ -454,21 +454,21 @@ export const lunacalTools: LunacalTool[] = [
         },
     },
 
-    {
-        name: "deleteEventType",
-        title: "Delete event type",
-        description: "Delete a Lunacal event type by its numeric id.",
-        inputSchema: z.object({
-            id: z.coerce.number().int(),
-        }),
-        handler: async ({ id }, accessToken) => {
-            try {
-                return ok(await callLunacalMcpApi("/event-types/delete", accessToken, { id }));
-            } catch (e) {
-                return err(e);
-            }
-        },
-    },
+    // {
+    //     name: "deleteEventType",
+    //     title: "Delete event type",
+    //     description: "Delete a Lunacal event type by its numeric id.",
+    //     inputSchema: z.object({
+    //         id: z.coerce.number().int(),
+    //     }),
+    //     handler: async ({ id }, accessToken) => {
+    //         try {
+    //             return ok(await callLunacalMcpApi("/event-types/delete", accessToken, { id }));
+    //         } catch (e) {
+    //             return err(e);
+    //         }
+    //     },
+    // },
 
     {
         name: "switchEventTypePublished",

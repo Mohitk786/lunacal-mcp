@@ -11,7 +11,7 @@ on:
   workflow_dispatch: {}
 
 env:
-  AZURE_WEBAPP_NAME: lunacal-mcp   # change to your App Service name
+  AZURE_WEBAPP_NAME: lunacal-mcp-app   # deployed under the Lunacal org Azure account
   IMAGE_NAME: lunacal-mcp-image
 
 jobs:

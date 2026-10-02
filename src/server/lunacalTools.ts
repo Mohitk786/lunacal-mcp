@@ -224,7 +224,7 @@ export const lunacalTools: LunacalTool[] = [
     {
         name: "rescheduleBooking",
         title: "Reschedule booking",
-        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+        annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
         description:
             "Reschedule an existing booking to a new time. There is no dedicated reschedule endpoint — " +
             "this goes through the same create-booking path with rescheduleUid set, which is the real " +
@@ -369,38 +369,33 @@ export const lunacalTools: LunacalTool[] = [
         title: "Create event type",
         annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
         description:
-            "Create a new Lunacal event type. Covers the commonly-used fields, but this isn't the full set — " +
-            "the real API accepts any real EventType field (e.g. locations, bookingFields, metadata for app " +
-            "config), and anything extra you include here passes through unvalidated to it. To enable a " +
-            "payment app on creation, set metadata.apps.stripe: {enabled, price (in the currency's smallest " +
-            "unit), currency, credentialId} — get the credentialId from get_connected_calendars-equivalent " +
-            "app-install data, or copy it from an existing event type's metadata via getEventTypeById.",
-        inputSchema: z
-            .object({
-                title: z.string().min(1),
-                slug: z.string().min(1),
-                length: z.coerce.number().int().describe("Duration in minutes"),
-                description: z.string().optional(),
-                hidden: z.boolean().optional(),
-                teamId: z.coerce.number().int().optional().describe("Required together with schedulingType for a team event"),
-                schedulingType: z.enum(["ROUND_ROBIN", "COLLECTIVE", "MANAGED"]).optional(),
-                minimumBookingNotice: z.coerce.number().int().min(0).optional(),
-                beforeEventBuffer: z.coerce.number().int().min(0).optional(),
-                afterEventBuffer: z.coerce.number().int().min(0).optional(),
-                isPublished: z.boolean().optional(),
-                seatsPerTimeSlot: z.coerce.number().int().nullable().optional().describe("Enables seats when set"),
-                seatsShowAttendees: z.boolean().nullable().optional(),
-                disableGuests: z.boolean().optional(),
-                requiresConfirmation: z.boolean().optional(),
-                successRedirectUrl: z.string().optional(),
-                locations: z.array(z.record(z.string(), z.unknown())).optional(),
-                bookingFields: z.array(z.record(z.string(), z.unknown())).optional(),
-                metadata: z
-                    .record(z.string(), z.unknown())
-                    .optional()
-                    .describe("e.g. { apps: { stripe: { enabled, price, currency, credentialId } } }"),
-            })
-            .loose(),
+            "Create a new Lunacal event type with the specified fields. To enable Stripe payments, set " +
+            "metadata.apps.stripe with enabled, price (in the currency's smallest unit), currency, and " +
+            "credentialId (copy from an existing event type's metadata via getEventTypeById).",
+        inputSchema: z.object({
+            title: z.string().min(1),
+            slug: z.string().min(1),
+            length: z.coerce.number().int().describe("Duration in minutes"),
+            description: z.string().optional(),
+            hidden: z.boolean().optional(),
+            teamId: z.coerce.number().int().optional().describe("Required together with schedulingType for a team event"),
+            schedulingType: z.enum(["ROUND_ROBIN", "COLLECTIVE", "MANAGED"]).optional(),
+            minimumBookingNotice: z.coerce.number().int().min(0).optional(),
+            beforeEventBuffer: z.coerce.number().int().min(0).optional(),
+            afterEventBuffer: z.coerce.number().int().min(0).optional(),
+            isPublished: z.boolean().optional(),
+            seatsPerTimeSlot: z.coerce.number().int().nullable().optional().describe("Enables seats when set"),
+            seatsShowAttendees: z.boolean().nullable().optional(),
+            disableGuests: z.boolean().optional(),
+            requiresConfirmation: z.boolean().optional(),
+            successRedirectUrl: z.string().optional(),
+            locations: z.array(z.record(z.string(), z.unknown())).optional(),
+            bookingFields: z.array(z.record(z.string(), z.unknown())).optional(),
+            metadata: z
+                .record(z.string(), z.unknown())
+                .optional()
+                .describe("e.g. { apps: { stripe: { enabled, price, currency, credentialId } } }"),
+        }).loose(),
         handler: async (body, accessToken) => {
             try {
                 return ok(await callLunacalMcpApi("/event-types/create", accessToken, body));
@@ -413,53 +408,44 @@ export const lunacalTools: LunacalTool[] = [
     {
         name: "updateEventType",
         title: "Update event type",
-        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+        annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
         description:
-            "Update fields on an existing Lunacal event type. Covers the commonly-edited fields, but this " +
-            "isn't the full set — the real API accepts any real EventType field, and anything extra you " +
-            "include here (not listed below) passes through unvalidated to it; the real API rejects fields " +
-            "it doesn't recognize, so only send fields that are genuine EventType properties. " +
-            "metadata and locations/bookingFields are REPLACED wholesale, not merged — fetch the current " +
-            "value via getEventTypeById first if you only want to change one part of them. To toggle a " +
-            "payment app (e.g. Stripe), set metadata.apps.stripe: {enabled, price, currency, credentialId}. " +
-            "NOTE: the response reflects the event type's state *before* this update, not after — " +
-            "call getEventTypeById afterward if you need the fresh state.",
-        inputSchema: z
-            .object({
-                id: z.coerce.number().int(),
-                title: z.string().optional(),
-                description: z.string().optional(),
-                slug: z.string().optional(),
-                length: z.coerce.number().int().optional().describe("Duration in minutes"),
-                hidden: z.boolean().optional(),
-                price: z.coerce.number().optional(),
-                currency: z.string().optional(),
-                minimumBookingNotice: z.coerce.number().int().optional(),
-                beforeEventBuffer: z.coerce.number().int().optional(),
-                afterEventBuffer: z.coerce.number().int().optional(),
-                scheduleId: z.coerce.number().int().nullable().optional(),
-                isPublished: z.boolean().optional(),
-                hashedLink: z.string().optional(),
-                seatsPerTimeSlot: z.coerce.number().int().nullable().optional().describe("Set null to disable seats"),
-                seatsShowAttendees: z.boolean().nullable().optional(),
-                disableGuests: z.boolean().optional(),
-                requiresConfirmation: z.boolean().optional(),
-                successRedirectUrl: z.string().optional(),
-                minSlotsPerPackage: z.coerce.number().int().min(1).nullable().optional(),
-                maxSlotsPerPackage: z.coerce.number().int().min(1).nullable().optional(),
-                locations: z.array(z.record(z.string(), z.unknown())).optional().describe("Replaces all locations wholesale"),
-                bookingFields: z
-                    .array(z.record(z.string(), z.unknown()))
-                    .optional()
-                    .describe("Replaces all custom booking fields wholesale"),
-                metadata: z
-                    .record(z.string(), z.unknown())
-                    .optional()
-                    .describe(
-                        "Replaces the whole metadata object wholesale — e.g. { apps: { stripe: { enabled, price, currency, credentialId } } }",
-                    ),
-            })
-            .loose(),
+            "Update fields on an existing Lunacal event type. Note: metadata, locations, and bookingFields " +
+            "are replaced wholesale — call getEventTypeById first if you only want to change one part. " +
+            "To toggle Stripe payments, set metadata.apps.stripe: {enabled, price, currency, credentialId}. " +
+            "The response reflects the state before this update — call getEventTypeById afterward for fresh state.",
+        inputSchema: z.object({
+            id: z.coerce.number().int(),
+            title: z.string().optional(),
+            description: z.string().optional(),
+            slug: z.string().optional(),
+            length: z.coerce.number().int().optional().describe("Duration in minutes"),
+            hidden: z.boolean().optional(),
+            price: z.coerce.number().optional(),
+            currency: z.string().optional(),
+            minimumBookingNotice: z.coerce.number().int().optional(),
+            beforeEventBuffer: z.coerce.number().int().optional(),
+            afterEventBuffer: z.coerce.number().int().optional(),
+            scheduleId: z.coerce.number().int().nullable().optional(),
+            isPublished: z.boolean().optional(),
+            hashedLink: z.string().optional(),
+            seatsPerTimeSlot: z.coerce.number().int().nullable().optional().describe("Set null to disable seats"),
+            seatsShowAttendees: z.boolean().nullable().optional(),
+            disableGuests: z.boolean().optional(),
+            requiresConfirmation: z.boolean().optional(),
+            successRedirectUrl: z.string().optional(),
+            minSlotsPerPackage: z.coerce.number().int().min(1).nullable().optional(),
+            maxSlotsPerPackage: z.coerce.number().int().min(1).nullable().optional(),
+            locations: z.array(z.record(z.string(), z.unknown())).optional().describe("Replaces all locations wholesale"),
+            bookingFields: z
+                .array(z.record(z.string(), z.unknown()))
+                .optional()
+                .describe("Replaces all custom booking fields wholesale"),
+            metadata: z
+                .record(z.string(), z.unknown())
+                .optional()
+                .describe("Replaces the whole metadata object — e.g. { apps: { stripe: { enabled, price, currency, credentialId } } }"),
+        }).loose(),
         handler: async ({ id, ...body }, accessToken) => {
             try {
                 return ok(await callLunacalMcpApi("/event-types/update", accessToken, { id, ...body }));
@@ -488,7 +474,7 @@ export const lunacalTools: LunacalTool[] = [
     {
         name: "switchEventTypePublished",
         title: "Publish/unpublish event type",
-        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
         description: "Toggle whether a Lunacal event type is published (bookable) or not.",
         inputSchema: z.object({
             eventId: z.coerce.number().int(),

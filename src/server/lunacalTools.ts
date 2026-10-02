@@ -367,7 +367,7 @@ export const lunacalTools: LunacalTool[] = [
     {
         name: "createEventType",
         title: "Create event type",
-        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
         description:
             "Create a new Lunacal event type with the specified fields. To enable Stripe payments, set " +
             "metadata.apps.stripe with enabled, price (in the currency's smallest unit), currency, and " +

@@ -78,6 +78,13 @@ createServer(async (req, res) => {
             return;
         }
 
+        // --- OpenAI domain verification ---
+        if (url.pathname === "/.well-known/openai-apps-challenge") {
+            const token = process.env.OPENAI_DOMAIN_TOKEN ?? "";
+            res.writeHead(200, { "Content-Type": "text/plain" }).end(token);
+            return;
+        }
+
         // --- OAuth Protected Resource Metadata (RFC 9728) ---
         if (url.pathname === "/.well-known/oauth-protected-resource") {
             sendJson(res, 200, {

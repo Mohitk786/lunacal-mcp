@@ -113,10 +113,18 @@ export function beginAuthorization(
     // early so a missing config fails fast instead of at the token exchange.
     requireLunacalClientConfig();
 
-    if (!params.client_id || !mcpClients.has(params.client_id)) {
-        throw new Error("Unknown client_id — register first via /register");
+    if (!params.client_id) {
+        throw new Error("client_id is required");
     }
-    if (!params.redirect_uri || !mcpClients.get(params.client_id)!.redirectUris.includes(params.redirect_uri)) {
+    if (!params.redirect_uri) {
+        throw new Error("redirect_uri is required");
+    }
+    // Auto-register on /authorize if the client_id isn't in memory — handles server
+    // restarts where in-memory state was lost but the MCP client cached its client_id.
+    if (!mcpClients.has(params.client_id)) {
+        mcpClients.set(params.client_id, { clientId: params.client_id, redirectUris: [params.redirect_uri] });
+    }
+    if (!mcpClients.get(params.client_id)!.redirectUris.includes(params.redirect_uri)) {
         throw new Error("redirect_uri does not match a registered redirect_uri for this client");
     }
 

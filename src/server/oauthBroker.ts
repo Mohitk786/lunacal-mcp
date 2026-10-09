@@ -1,25 +1,7 @@
 import { randomBytes, createHash } from "node:crypto";
 
-/**
- * Bridges MCP's expected OAuth shape (dynamic client registration + PKCE,
- * per the MCP spec) to Lunacal's actual auth model — a bespoke, minimal flow
- * built specifically for lunacal-mcp (see apps/web/pages/api/mcp/* and
- * apps/web/pages/auth/platform/authorize.tsx in calendar-scheduling), not
- * Cal.com's own apps/api/v2 Platform OAuth system, which Lunacal never
- * deployed. Since there's only ever one client (lunacal-mcp itself), the
- * consent page doesn't need a client_id to look anything up.
- *
- * We are the OAuth *server* to MCP clients and the OAuth *client* to Lunacal.
- * State lives in memory — fine for a first version, but a restart drops every
- * pending login and issued token; move this to a real store before this runs
- * as more than one process or needs to survive restarts.
- */
-
-// Read lazily (inside functions), not as module-level constants: index.ts's
-// dotenv.config() call runs after all of its imports are evaluated — ESM
-// always fully evaluates the import graph before an importing module's own
-// top-level statements — so a module-level `process.env.X` read here would
-// always capture undefined, regardless of what's actually in .env.
+// OAuth broker: we are the OAuth *server* to MCP clients and the OAuth *client* to Lunacal.
+// State lives in memory — a restart drops pending logins and issued tokens.
 function getLunacalWebappUrl(): string {
     return process.env.LUNACAL_WEBAPP_URL ?? "https://app.lunacal.ai";
 }
@@ -50,11 +32,28 @@ interface OurAuthCode {
     createdAt: number;
 }
 
+const AUTH_CODE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const PENDING_AUTH_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const MAX_REGISTERED_CLIENTS = 10_000;
+const CLEANUP_INTERVAL_MS = 60 * 1000; // 1 minute
+
 const mcpClients = new Map<string, RegisteredMcpClient>();
 const pendingAuthorizations = new Map<string, PendingAuthorization>();
 const ourAuthCodes = new Map<string, OurAuthCode>();
-// Our issued access token -> the Lunacal tokens it stands in for.
 const issuedTokens = new Map<string, LunacalTokens>();
+
+setInterval(() => {
+    const now = Date.now();
+    for (const [k, v] of pendingAuthorizations) {
+        if (now - v.createdAt > PENDING_AUTH_TTL_MS) pendingAuthorizations.delete(k);
+    }
+    for (const [k, v] of ourAuthCodes) {
+        if (now - v.createdAt > AUTH_CODE_TTL_MS) ourAuthCodes.delete(k);
+    }
+    for (const [k, v] of issuedTokens) {
+        if (now > v.expiresAt) issuedTokens.delete(k);
+    }
+}, CLEANUP_INTERVAL_MS).unref();
 
 function requireLunacalClientConfig(): { clientId: string; clientSecret: string } {
     const clientId = process.env.LUNACAL_OAUTH_CLIENT_ID;
@@ -82,23 +81,20 @@ export function ourCallbackUrl(publicBaseUrl: string): string {
     return `${publicBaseUrl}/oauth/lunacal/callback`;
 }
 
-/** RFC 7591 dynamic client registration — trivially accepts any MCP client and hands it a fresh id. */
 export function registerMcpClient(body: { redirect_uris?: string[] }): {
     client_id: string;
     redirect_uris: string[];
     token_endpoint_auth_method: "none";
 } {
+    if (mcpClients.size >= MAX_REGISTERED_CLIENTS) {
+        throw new Error("Too many registered clients");
+    }
     const clientId = randomToken(16);
     const redirectUris = body.redirect_uris ?? [];
     mcpClients.set(clientId, { clientId, redirectUris });
     return { client_id: clientId, redirect_uris: redirectUris, token_endpoint_auth_method: "none" };
 }
 
-/**
- * Handles the incoming MCP client's /authorize request: validates it, stashes
- * what we'll need once Lunacal redirects back to us, and returns the URL to
- * send the user's browser to next (Lunacal's own authorize page).
- */
 export function beginAuthorization(
     params: {
         client_id?: string;
@@ -109,8 +105,6 @@ export function beginAuthorization(
     },
     publicBaseUrl: string,
 ): URL {
-    // Not needed to build this URL (there's only one client), but checked
-    // early so a missing config fails fast instead of at the token exchange.
     requireLunacalClientConfig();
 
     if (!params.client_id) {
@@ -119,8 +113,7 @@ export function beginAuthorization(
     if (!params.redirect_uri) {
         throw new Error("redirect_uri is required");
     }
-    // Auto-register on /authorize if the client_id isn't in memory — handles server
-    // restarts where in-memory state was lost but the MCP client cached its client_id.
+    // Auto-register if client_id was lost on restart but the MCP client cached it.
     if (!mcpClients.has(params.client_id)) {
         mcpClients.set(params.client_id, { clientId: params.client_id, redirectUris: [params.redirect_uri] });
     }
@@ -138,22 +131,12 @@ export function beginAuthorization(
         createdAt: Date.now(),
     });
 
-    // Lunacal's consent page (apps/web/pages/auth/platform/authorize.tsx) renders
-    // the "Allow" prompt and, on click, calls its own /api/mcp/authorize with
-    // our fixed callback as redirect_uri. No client_id is sent — the page
-    // already knows which client it is (there's only ever the one).
     const url = new URL(`${getLunacalWebappUrl()}/auth/platform/authorize`);
     url.searchParams.set("redirect_uri", ourCallbackUrl(publicBaseUrl));
     url.searchParams.set("state", ourState);
     return url;
 }
 
-/**
- * Handles Lunacal's redirect back to us (?code=...&state=...): exchanges the
- * Lunacal auth code for Lunacal tokens, mints OUR OWN auth code for the
- * original MCP client, and returns the URL to send the browser to next
- * (the MCP client's own redirect_uri).
- */
 export async function finishLunacalAuthorization(query: { code?: string; state?: string }): Promise<URL> {
     if (!query.code || !query.state) {
         throw new Error("Missing code or state on Lunacal callback");
@@ -200,7 +183,6 @@ export async function finishLunacalAuthorization(query: { code?: string; state?:
     return redirectUrl;
 }
 
-/** The MCP client's /token request: exchanges our auth code (+ PKCE verifier) for one of our access tokens. */
 export function exchangeOurCode(body: { code?: string; code_verifier?: string }): {
     access_token: string;
     token_type: "bearer";
@@ -214,6 +196,10 @@ export function exchangeOurCode(body: { code?: string; code_verifier?: string })
         throw new Error("Unknown or already-used code");
     }
     ourAuthCodes.delete(body.code);
+
+    if (Date.now() - entry.createdAt > AUTH_CODE_TTL_MS) {
+        throw new Error("Authorization code expired");
+    }
 
     if (entry.mcpCodeChallenge) {
         if (!body.code_verifier || !verifyPkce(body.code_verifier, entry.mcpCodeChallenge)) {
@@ -231,7 +217,12 @@ export function exchangeOurCode(body: { code?: string; code_verifier?: string })
     };
 }
 
-/** Resolves one of our issued access tokens back to the underlying Lunacal access token, for the API client to use. */
 export function resolveLunacalAccessToken(ourAccessToken: string): string | undefined {
-    return issuedTokens.get(ourAccessToken)?.accessToken;
+    const entry = issuedTokens.get(ourAccessToken);
+    if (!entry) return undefined;
+    if (Date.now() > entry.expiresAt) {
+        issuedTokens.delete(ourAccessToken);
+        return undefined;
+    }
+    return entry.accessToken;
 }

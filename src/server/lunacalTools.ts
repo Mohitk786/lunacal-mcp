@@ -38,19 +38,7 @@ interface LunacalTool {
     handler: (args: any, accessToken: string) => Promise<ToolResult>;
 }
 
-/**
- * Matches `bookingResponses` (packages/prisma/zod-utils.ts) exactly — the
- * schema handleNewBooking actually validates attendee fields against. These
- * live NESTED under `responses` on the booking body, not flat on it.
- *
- * `bookingResponses` is only the BASE shape — the real schema used at runtime
- * is `bookingResponses.and(z.record(z.any()))` (getBookingResponsesSchema),
- * an intersection that also accepts one key per CUSTOM booking question the
- * host configured on the event type (keyed by that question's own field
- * name, from eventType.bookingFields — see getEventTypeById). Required
- * custom questions will fail validation if missing, so `additionalResponses`
- * carries those through untouched.
- */
+// Attendee fields live nested under `responses`, not flat on the booking body.
 function buildBookingResponses(fields: {
     name?: string;
     email?: string;
@@ -72,13 +60,6 @@ function buildBookingResponses(fields: {
     };
 }
 
-/**
- * Every tool this server exposes, as plain data. Each calls one of
- * lunacal-mcp's dedicated routes on the Lunacal webapp
- * (apps/web/pages/api/mcp/*), which in turn call the same tRPC procedures /
- * booking handlers the app's own UI uses — not a REST API, since Lunacal has
- * never deployed one (apps/api/v1/v2 exist in source but aren't run).
- */
 export const lunacalTools: LunacalTool[] = [
     {
         name: "getMe",
@@ -204,13 +185,7 @@ export const lunacalTools: LunacalTool[] = [
                         timeZone,
                         language,
                         metadata,
-                        // handleNewBooking validates against extendedBookingCreateBody.merge({responses: ...})
-                        // (packages/features/bookings/lib/getBookingDataSchema.ts) — attendee fields live
-                        // NESTED under `responses` (packages/prisma/zod-utils.ts's `bookingResponses`
-                        // schema), not flat on the body. location, if set, must be {value, optionValue}.
                         responses: buildBookingResponses({ name, email, guests, notes, location, additionalResponses }),
-                        // Same schema requires these two recurring-booking fields with no .optional() —
-                        // empty arrays satisfy validation for a normal, non-recurring booking.
                         bookingUids: [],
                         slots: [],
                     }),
@@ -497,12 +472,6 @@ export const lunacalTools: LunacalTool[] = [
     },
 ];
 
-/**
- * Registers every entry in lunacalTools on a fresh McpServer instance (called
- * once per request — see server/index.ts). oauthAccessToken is the caller's
- * own Lunacal access token, resolved from their OAuth login via
- * oauthBroker.ts; every tool call requires one.
- */
 export function registerLunacalTools(server: McpServer, oauthAccessToken?: string): void {
     for (const tool of lunacalTools) {
         server.registerTool(

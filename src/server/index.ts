@@ -24,28 +24,36 @@ const handler = createMcpHandler((ctx) => {
         version: "1.0.0",
         icons: [{ src: `${getWebappUrl()}/lunacal-icon.svg`, mimeType: "image/svg+xml" }],
     });
-    // ctx.authInfo.token, when present, IS the resolved Lunacal access token
-    // (see index()'s request handling below and oauthBroker.resolveLunacalAccessToken)
-    // — not a token the MCP client can read or forge.
     registerLunacalTools(server, ctx.authInfo?.token);
     return server;
 });
 
 const nodeHandler = toNodeHandler(handler);
 
+const MAX_BODY_BYTES = 1024 * 1024;
+
+const CORS_HEADERS: Record<string, string> = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Authorization, Content-Type",
+};
+
 async function readRawBody(req: IncomingMessage): Promise<string> {
     const chunks: Buffer[] = [];
-    for await (const chunk of req) chunks.push(chunk as Buffer);
+    let totalBytes = 0;
+    for await (const chunk of req) {
+        totalBytes += (chunk as Buffer).length;
+        if (totalBytes > MAX_BODY_BYTES) throw new Error("Request body too large");
+        chunks.push(chunk as Buffer);
+    }
     return Buffer.concat(chunks).toString("utf-8");
 }
 
-/** DCR requests are always JSON per RFC 7591. */
 async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
     const raw = await readRawBody(req);
     return raw ? JSON.parse(raw) : {};
 }
 
-/** Token requests are conventionally application/x-www-form-urlencoded per OAuth2, but accept JSON too. */
 async function readTokenRequestBody(req: IncomingMessage): Promise<Record<string, string>> {
     const raw = await readRawBody(req);
     if (!raw) return {};
@@ -61,6 +69,13 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
 
 createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", PUBLIC_BASE_URL);
+
+    for (const [k, v] of Object.entries(CORS_HEADERS)) res.setHeader(k, v);
+
+    if (req.method === "OPTIONS") {
+        res.writeHead(204).end();
+        return;
+    }
 
     try {
         // --- OAuth discovery (RFC 8414) ---
@@ -170,7 +185,7 @@ createServer(async (req, res) => {
     } catch (e) {
         console.error("Request error:", e);
         if (!res.headersSent) {
-            sendJson(res, 400, { error: e instanceof Error ? e.message : String(e) });
+            sendJson(res, 400, { error: "Bad request" });
         }
     }
 }).listen(PORT, "0.0.0.0", () => {

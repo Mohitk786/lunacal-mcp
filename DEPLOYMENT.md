@@ -7,6 +7,23 @@ Docker, push to **Azure Container Registry**, deploy with `azure/webapps-deploy`
 publish profile. Unlike that app, lunacal-mcp needs no runtime placeholder-substitution
 entrypoint — it reads `process.env` directly, so plain App Settings are enough.
 
+## Current deployment
+
+| | |
+|---|---|
+| Azure account | Lunacal org tenant ("Lunacal Private Limited", subscription "Microsoft Azure Sponsorship") |
+| URL | `https://lunacal-mcp-app.azurewebsites.net` |
+| Resource group | `lunacal-mcp-app_group` (Canada Central — same region as `lunacal-test-app` and the shared ACR) |
+| App Service plan | `lunacal-mcp-app-plan` (Linux, B1) |
+| Container registry | shared `newlunacalcontainer.azurecr.io`, repo `lunacal-mcp-image` |
+| Pointed at | `https://testing.lunacal.ai` (set `LUNACAL_WEBAPP_URL` to change) |
+
+A separate, earlier deployment also exists in a personal Azure subscription
+(`lunacal-mcp.azurewebsites.net`, resource group `lunacal-mcp-rg`, its own dedicated ACR
+`lunacalmcpacr`) — kept running for now as a fallback. Delete it
+(`az group delete --name lunacal-mcp-rg`) once the org deployment above is confirmed
+working end-to-end with a real MCP client.
+
 ## Important constraint: run exactly 1 instance
 
 `src/server/oauthBroker.ts` keeps all OAuth state (pending logins, issued tokens) **in
@@ -15,15 +32,16 @@ an instance that never saw the matching `/authorize` or `/token` step, breaking 
 non-deterministically. Do not enable autoscale / multiple instances for this app until
 that state is moved to a shared store (e.g. Redis).
 
-## One-time Azure setup
+## One-time Azure setup (for provisioning a fresh copy)
 
 ```bash
-az login
+az login   # must be the Lunacal org account to reuse the shared ACR below
 
-RESOURCE_GROUP=lunacal-mcp-rg
-LOCATION=eastus
-PLAN_NAME=lunacal-mcp-plan
-APP_NAME=lunacal-mcp          # must be globally unique; becomes <APP_NAME>.azurewebsites.net
+RESOURCE_GROUP=lunacal-mcp-app_group
+LOCATION=canadacentral
+PLAN_NAME=lunacal-mcp-app-plan
+APP_NAME=lunacal-mcp-app     # must be globally unique; becomes <APP_NAME>.azurewebsites.net
+ACR_NAME=newlunacalcontainer # the org's existing shared registry
 
 az group create --name $RESOURCE_GROUP --location $LOCATION
 
@@ -35,8 +53,6 @@ az appservice plan create \
   --is-linux \
   --sku B1 \
   --number-of-workers 1
-
-ACR_NAME=newlunacalcontainer   # reuse the org's existing registry, as calendar-scheduling does
 
 az webapp create \
   --name $APP_NAME \
@@ -55,18 +71,21 @@ az webapp config appsettings set --name $APP_NAME --resource-group $RESOURCE_GRO
   WEBSITES_PORT=3939 \
   PORT=3939 \
   LUNACAL_MCP_PUBLIC_URL="https://$APP_NAME.azurewebsites.net" \
-  LUNACAL_WEBAPP_URL="https://app.lunacal.ai" \
-  LUNACAL_OAUTH_CLIENT_ID="<from your .env>" \
-  LUNACAL_OAUTH_CLIENT_SECRET="<from your .env>"
+  LUNACAL_WEBAPP_URL="https://testing.lunacal.ai" \
+  LUNACAL_OAUTH_CLIENT_ID="<PlatformOAuthClient id>" \
+  LUNACAL_OAUTH_CLIENT_SECRET="<PlatformOAuthClient secret>"
 ```
 
 `WEBSITES_PORT` tells App Service which port the container listens on — it must match
-the `PORT` the app itself reads (see `Dockerfile`, defaults to `3939`).
+the `PORT` the app itself reads (see `Dockerfile`, defaults to `3939`). After changing
+settings, restart (`az webapp restart ...`) and re-check the verification curl below —
+a stale container instance can keep serving the old config for a bit after a settings
+change alone.
 
 ### Registry access (Azure Container Registry)
 
-Like the other Lunacal apps, images go to the org's ACR (`newlunacalcontainer.azurecr.io`),
-not GHCR. Point App Service at it with ACR's admin credentials:
+Images go to the org's shared ACR (`newlunacalcontainer.azurecr.io`), not GHCR. Point App
+Service at it with the registry's admin credentials:
 
 ```bash
 az acr credential show --name $ACR_NAME --query "{user:username,pass:passwords[0].value}"
@@ -90,15 +109,12 @@ instead (`az acr create --name <new-name> --resource-group $RESOURCE_GROUP --sku
 
 ### Get the publish profile for CI/CD
 
-```bash
-az webapp deployment list-publishing-profiles \
-  --name $APP_NAME --resource-group $RESOURCE_GROUP --xml > publish-profile.xml
-```
-
-Copy the file's contents into a GitHub repo secret named `AZURE_WEBAPP_PUBLISH_PROFILE`
-(Settings → Secrets and variables → Actions). Also update `AZURE_WEBAPP_NAME` in
-`.github/workflows/azure-deploy.yml` if you used a different `$APP_NAME`. Delete
-`publish-profile.xml` locally afterward — it contains credentials.
+`az webapp deployment list-publishing-profiles --xml` redacts the credential fields in
+its own output (a real Azure CLI security feature, not something you can pass a flag
+around) — don't rely on piping it to a file from a script. Get the real file from the
+**Azure Portal** instead: Web App → Overview → **Download publish profile**. Paste that
+file's full contents as the `AZURE_WEBAPP_PUBLISH_PROFILE` GitHub repo secret. Also keep
+`AZURE_WEBAPP_NAME` in `.github/workflows/azure-deploy.yml` in sync with `$APP_NAME`.
 
 ## Deploying
 
@@ -106,16 +122,23 @@ Push to `main` and the `azure-deploy` workflow builds the Docker image, pushes i
 ACR, and points the App Service at the new image tag. To deploy manually instead:
 
 ```bash
-az acr login --name $ACR_NAME
-docker build -t $ACR_NAME.azurecr.io/lunacal-mcp-image:latest .
-docker push $ACR_NAME.azurecr.io/lunacal-mcp-image:latest
+az acr build --registry $ACR_NAME --image lunacal-mcp-image:latest .
 az webapp restart --name $APP_NAME --resource-group $RESOURCE_GROUP
 ```
+
+(`az acr build` builds in the cloud and pushes directly — no local `docker login`/`push`
+needed, and no local Docker Desktop required either.)
 
 ## Verifying
 
 ```bash
 curl https://$APP_NAME.azurewebsites.net/.well-known/oauth-protected-resource
+curl https://$APP_NAME.azurewebsites.net/.well-known/oauth-authorization-server
+curl -o /dev/null -w "%{http_code}\n" https://$APP_NAME.azurewebsites.net/mcp   # expect 401, not 404/502
 ```
 
-Should return the JSON metadata document, not a 404/502.
+The first two should return JSON metadata documents whose URLs match `$APP_NAME` (not
+`localhost` — that means the container hasn't picked up `LUNACAL_MCP_PUBLIC_URL` yet,
+usually fixed by one more restart). None of this proves the OAuth exchange with Lunacal
+itself works — only a real MCP client walking through login against
+`LUNACAL_WEBAPP_URL` confirms that.

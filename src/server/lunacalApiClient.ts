@@ -13,13 +13,6 @@ export function getWebappUrl(): string {
     return process.env.LUNACAL_WEBAPP_URL ?? DEFAULT_WEBAPP_URL;
 }
 
-/**
- * Calls one of lunacal-mcp's dedicated routes on the Lunacal webapp itself
- * (apps/web/pages/api/mcp/*), which internally call the same tRPC procedures
- * and booking handlers the app's own UI uses — there is no separate REST API
- * (apps/api/v1/v2 exist in that repo's source but are never deployed).
- * Every call needs the per-user OAuth access token from oauthBroker.ts.
- */
 export async function callLunacalMcpApi<T = unknown>(
     path: string,
     accessToken: string,

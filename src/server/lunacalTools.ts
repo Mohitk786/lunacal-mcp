@@ -32,6 +32,7 @@ interface LunacalTool {
     annotations: {
         readOnlyHint: boolean;
         destructiveHint: boolean;
+        idempotentHint: boolean;
         openWorldHint: boolean;
     };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -67,7 +68,7 @@ export const lunacalTools: LunacalTool[] = [
         description:
             "Get the authenticated user's own Lunacal profile: name, email, username, timezone, subscription " +
             "and voice-agent-subscription state, team/event-type counts, feature flags, and more.",
-        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
         inputSchema: z.object({
             includePasswordAdded: z.boolean().optional(),
             includeSubscription: z.boolean().optional(),
@@ -85,7 +86,7 @@ export const lunacalTools: LunacalTool[] = [
         name: "getBookings",
         title: "List bookings",
         description: "List the authenticated user's Lunacal bookings. `status` is required by the underlying API.",
-        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
         inputSchema: z.object({
             status: z.enum(["upcoming", "recurring", "past", "cancelled", "unconfirmed"]),
             teamIds: z.array(z.coerce.number().int()).optional(),
@@ -115,12 +116,13 @@ export const lunacalTools: LunacalTool[] = [
     {
         name: "getAvailability",
         title: "Get availability",
-        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
         description:
-            "Get an event type's available booking slots in a time range. Always call this before " +
-            "createBooking/rescheduleBooking to confirm a slot is actually free — neither of those tools " +
-            "checks availability itself. Identify the event type by eventTypeId, OR by eventTypeSlug " +
-            "combined with usernameList (the host's username, as a single-element array for an individual).",
+            "Get an event type's available booking slots in a time range. " +
+            "createBooking and rescheduleBooking do not verify availability, so open slots should be " +
+            "confirmed here before creating or rescheduling. Identify the event type by eventTypeId, " +
+            "OR by eventTypeSlug combined with usernameList (the host's username, as a single-element " +
+            "array for an individual).",
         inputSchema: z.object({
             startTime: z.string().describe("ISO 8601 range start"),
             endTime: z.string().describe("ISO 8601 range end"),
@@ -145,12 +147,12 @@ export const lunacalTools: LunacalTool[] = [
     {
         name: "createBooking",
         title: "Create booking",
-        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
         description:
-            "Create a new booking against a Lunacal event type. Call getAvailability first to confirm the " +
-            "slot is actually free — this does not check availability itself. If the event type has custom " +
-            "booking questions (check eventType.bookingFields via getEventTypeById), answer required ones " +
-            "via additionalResponses or the booking will fail validation.",
+            "Create a new booking against a Lunacal event type. This tool does not verify slot " +
+            "availability. If the event type has custom booking questions (visible in " +
+            "eventType.bookingFields from getEventTypeById), required ones must be answered via " +
+            "additionalResponses or the booking will fail validation.",
         inputSchema: z.object({
             eventTypeId: z.coerce.number().int(),
             start: z.string().describe("ISO 8601 start time"),
@@ -199,12 +201,11 @@ export const lunacalTools: LunacalTool[] = [
     {
         name: "rescheduleBooking",
         title: "Reschedule booking",
-        annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
         description:
-            "Reschedule an existing booking to a new time. There is no dedicated reschedule endpoint — " +
-            "this goes through the same create-booking path with rescheduleUid set, which is the real " +
-            "reschedule path. Call getAvailability first to confirm the new slot is actually free. If the " +
-            "event type has custom booking questions, answer required ones via additionalResponses.",
+            "Reschedule an existing booking to a new time. Internally uses the create-booking path " +
+            "with rescheduleUid set. This tool does not verify slot availability. If the event type " +
+            "has custom booking questions, required ones must be answered via additionalResponses.",
         inputSchema: z.object({
             rescheduleUid: z.string().describe("The uid of the booking being rescheduled"),
             eventTypeId: z.coerce.number().int(),
@@ -278,8 +279,8 @@ export const lunacalTools: LunacalTool[] = [
     {
         name: "cancelBooking",
         title: "Cancel booking",
-        annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
-        description: "Cancel a booking by its uid. The underlying schema requires uid, not the numeric booking id.",
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+        description: "Cancel a booking by its uid. Requires the booking uid, not the numeric booking id.",
         inputSchema: z.object({
             uid: z.string().describe("Booking uid"),
             allRemainingBookings: z.boolean().optional(),
@@ -303,7 +304,7 @@ export const lunacalTools: LunacalTool[] = [
     {
         name: "getEventTypes",
         title: "List event types",
-        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
         description: "List the authenticated user's Lunacal event types (across their personal and team profiles).",
         inputSchema: z.object({
             teamIds: z.array(z.coerce.number().int()).optional(),
@@ -325,7 +326,7 @@ export const lunacalTools: LunacalTool[] = [
     {
         name: "getEventTypeById",
         title: "Get event type",
-        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
         description: "Get a single Lunacal event type by its numeric id, including team members and location options.",
         inputSchema: z.object({
             id: z.coerce.number().int(),
@@ -342,11 +343,11 @@ export const lunacalTools: LunacalTool[] = [
     {
         name: "createEventType",
         title: "Create event type",
-        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
         description:
             "Create a new Lunacal event type with the specified fields. To enable Stripe payments, set " +
             "metadata.apps.stripe with enabled, price (in the currency's smallest unit), currency, and " +
-            "credentialId (copy from an existing event type's metadata via getEventTypeById).",
+            "credentialId (available in an existing event type's metadata from getEventTypeById).",
         inputSchema: z.object({
             title: z.string().min(1),
             slug: z.string().min(1),
@@ -383,12 +384,12 @@ export const lunacalTools: LunacalTool[] = [
     {
         name: "updateEventType",
         title: "Update event type",
-        annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
         description:
-            "Update fields on an existing Lunacal event type. Note: metadata, locations, and bookingFields " +
-            "are replaced wholesale — call getEventTypeById first if you only want to change one part. " +
-            "To toggle Stripe payments, set metadata.apps.stripe: {enabled, price, currency, credentialId}. " +
-            "The response reflects the state before this update — call getEventTypeById afterward for fresh state.",
+            "Update fields on an existing Lunacal event type. metadata, locations, and bookingFields " +
+            "are replaced wholesale, not merged — partial updates require the full current value from " +
+            "getEventTypeById. To toggle Stripe payments, set metadata.apps.stripe with enabled, price, " +
+            "currency, and credentialId. The response reflects the state before the update.",
         inputSchema: z.object({
             id: z.coerce.number().int(),
             title: z.string().optional(),
@@ -449,8 +450,8 @@ export const lunacalTools: LunacalTool[] = [
     {
         name: "switchEventTypePublished",
         title: "Publish/unpublish event type",
-        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
-        description: "Toggle whether a Lunacal event type is published (bookable) or not.",
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+        description: "Set whether a Lunacal event type is published (bookable) or unpublished.",
         inputSchema: z.object({
             eventId: z.coerce.number().int(),
             isPublished: z.boolean(),

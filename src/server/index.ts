@@ -185,7 +185,12 @@ createServer(async (req, res) => {
     } catch (e) {
         console.error("Request error:", e);
         if (!res.headersSent) {
-            sendJson(res, 400, { error: "Bad request" });
+            const message = e instanceof SyntaxError
+                ? "Invalid JSON in request body"
+                : e instanceof Error && e.message === "Request body too large"
+                    ? "Request body exceeds 1 MB limit"
+                    : "Unexpected server error";
+            sendJson(res, e instanceof SyntaxError ? 400 : 500, { error: message });
         }
     }
 }).listen(PORT, "0.0.0.0", () => {

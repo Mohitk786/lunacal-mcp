@@ -27,8 +27,8 @@ interface LunacalTokens {
 
 interface OurAuthCode {
     lunacalTokens: LunacalTokens;
-    mcpCodeChallenge?: string;
-    mcpCodeChallengeMethod?: string;
+    mcpClientId: string;
+    mcpCodeChallenge: string;
     createdAt: number;
 }
 
@@ -120,6 +120,9 @@ export function beginAuthorization(
     if (!mcpClients.get(params.client_id)!.redirectUris.includes(params.redirect_uri)) {
         throw new Error("redirect_uri does not match a registered redirect_uri for this client");
     }
+    if (!params.code_challenge || params.code_challenge_method !== "S256") {
+        throw new Error("PKCE with S256 is required");
+    }
 
     const ourState = randomToken();
     pendingAuthorizations.set(ourState, {
@@ -170,8 +173,8 @@ export async function finishLunacalAuthorization(query: { code?: string; state?:
             accessToken,
             expiresAt: new Date(expiresAt).getTime(),
         },
-        mcpCodeChallenge: pending.mcpCodeChallenge,
-        mcpCodeChallengeMethod: pending.mcpCodeChallengeMethod,
+        mcpClientId: pending.mcpClientId,
+        mcpCodeChallenge: pending.mcpCodeChallenge!,
         createdAt: Date.now(),
     });
 
@@ -183,7 +186,7 @@ export async function finishLunacalAuthorization(query: { code?: string; state?:
     return redirectUrl;
 }
 
-export function exchangeOurCode(body: { code?: string; code_verifier?: string }): {
+export function exchangeOurCode(body: { code?: string; code_verifier?: string; client_id?: string }): {
     access_token: string;
     token_type: "bearer";
     expires_in: number;
@@ -191,20 +194,25 @@ export function exchangeOurCode(body: { code?: string; code_verifier?: string })
     if (!body.code) {
         throw new Error("Missing code");
     }
+    if (!body.client_id) {
+        throw new Error("Missing client_id");
+    }
     const entry = ourAuthCodes.get(body.code);
     if (!entry) {
         throw new Error("Unknown or already-used code");
     }
     ourAuthCodes.delete(body.code);
 
+    if (entry.mcpClientId !== body.client_id) {
+        throw new Error("client_id does not match the authorization request");
+    }
+
     if (Date.now() - entry.createdAt > AUTH_CODE_TTL_MS) {
         throw new Error("Authorization code expired");
     }
 
-    if (entry.mcpCodeChallenge) {
-        if (!body.code_verifier || !verifyPkce(body.code_verifier, entry.mcpCodeChallenge)) {
-            throw new Error("PKCE verification failed");
-        }
+    if (!body.code_verifier || !verifyPkce(body.code_verifier, entry.mcpCodeChallenge)) {
+        throw new Error("PKCE verification failed");
     }
 
     const ourAccessToken = randomToken();

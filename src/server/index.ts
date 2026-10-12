@@ -38,6 +38,53 @@ const CORS_HEADERS: Record<string, string> = {
     "Access-Control-Allow-Headers": "Authorization, Content-Type",
 };
 
+class RateLimiter {
+    private windows = new Map<string, { count: number; resetAt: number }>();
+    constructor(
+        private maxRequests: number,
+        private windowMs: number,
+    ) {}
+
+    check(key: string): boolean {
+        const now = Date.now();
+        const entry = this.windows.get(key);
+        if (!entry || now > entry.resetAt) {
+            this.windows.set(key, { count: 1, resetAt: now + this.windowMs });
+            return true;
+        }
+        if (entry.count >= this.maxRequests) return false;
+        entry.count++;
+        return true;
+    }
+
+    cleanup(): void {
+        const now = Date.now();
+        for (const [k, v] of this.windows) {
+            if (now > v.resetAt) this.windows.delete(k);
+        }
+    }
+}
+
+const rateLimiters = {
+    general: new RateLimiter(60, 60_000),
+    register: new RateLimiter(10, 60_000),
+    mcp: new RateLimiter(120, 60_000),
+    token: new RateLimiter(20, 60_000),
+};
+
+setInterval(() => {
+    for (const rl of Object.values(rateLimiters)) rl.cleanup();
+}, 60_000).unref();
+
+function getClientIp(req: IncomingMessage): string {
+    const forwarded = req.headers["x-forwarded-for"];
+    if (forwarded) {
+        const first = Array.isArray(forwarded) ? forwarded[0] : forwarded.split(",")[0];
+        return first.trim();
+    }
+    return req.socket.remoteAddress ?? "unknown";
+}
+
 async function readRawBody(req: IncomingMessage): Promise<string> {
     const chunks: Buffer[] = [];
     let totalBytes = 0;
@@ -74,6 +121,18 @@ createServer(async (req, res) => {
 
     if (req.method === "OPTIONS") {
         res.writeHead(204).end();
+        return;
+    }
+
+    const clientIp = getClientIp(req);
+    const limiter =
+        url.pathname === MCP_PATH ? rateLimiters.mcp
+        : url.pathname === "/register" ? rateLimiters.register
+        : url.pathname === "/token" ? rateLimiters.token
+        : rateLimiters.general;
+
+    if (!limiter.check(clientIp)) {
+        sendJson(res, 429, { error: "Too many requests, please try again later" });
         return;
     }
 
@@ -147,7 +206,7 @@ createServer(async (req, res) => {
         // --- Step 3: MCP client exchanges our code for one of our access tokens ---
         if (url.pathname === "/token" && req.method === "POST") {
             const body = await readTokenRequestBody(req);
-            sendJson(res, 200, exchangeOurCode({ code: body.code, code_verifier: body.code_verifier }));
+            sendJson(res, 200, exchangeOurCode({ code: body.code, code_verifier: body.code_verifier, client_id: body.client_id }));
             return;
         }
 

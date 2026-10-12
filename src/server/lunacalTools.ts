@@ -13,9 +13,14 @@ function ok(data: unknown): ToolResult {
 
 function err(e: unknown): ToolResult {
     if (e instanceof LunacalApiError) {
+        const body = e.body as Record<string, unknown> | undefined;
+        const message =
+            typeof body?.message === "string" ? body.message
+            : typeof body?.error === "string" ? body.error
+            : "Request failed";
         return {
             isError: true,
-            content: [{ type: "text", text: `Lunacal API error ${e.status}: ${JSON.stringify(e.body)}` }],
+            content: [{ type: "text", text: `Lunacal API error (${e.status}): ${message}` }],
         };
     }
     return {

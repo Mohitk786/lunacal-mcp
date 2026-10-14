@@ -1,259 +1,370 @@
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import dotenv from "dotenv";
+#!/usr/bin/env node
+import { createServer, type IncomingMessage, type OutgoingHttpHeaders, type ServerResponse } from "node:http";
 import { McpServer, createMcpHandler, type AuthInfo } from "@modelcontextprotocol/server";
 import { toNodeHandler, type NodeIncomingMessageLike } from "@modelcontextprotocol/node";
-import { registerLunacalTools } from "./lunacalTools.js";
+import { config } from "./config.js";
+import { sha256 } from "./crypto.js";
+import { checkDb, cleanupExpired, closePool, migrate } from "./db.js";
+import { SERVER_INSTRUCTIONS } from "./instructions.js";
 import { getWebappUrl } from "./lunacalApiClient.js";
+import { registerLunacalTools } from "./lunacalTools.js";
+import { log } from "./log.js";
+import { GrantDeadError, OAuthError, UpstreamTemporaryError } from "./oauthErrors.js";
 import {
-    registerMcpClient,
     beginAuthorization,
+    exchangeToken,
     finishLunacalAuthorization,
-    exchangeOurCode,
-    resolveLunacalAccessToken,
+    registerMcpClient,
+    resolveMcpAccess,
 } from "./oauthBroker.js";
+import { RateLimiter } from "./rateLimit.js";
+import { requestStore, type RequestStore } from "./requestContext.js";
 
-dotenv.config();
-
-const PORT = Number(process.env.PORT ?? process.env.LUNACAL_MCP_PORT ?? 3939);
-const PUBLIC_BASE_URL = process.env.LUNACAL_MCP_PUBLIC_URL ?? `http://localhost:${PORT}`;
 const MCP_PATH = "/mcp";
+const MAX_BODY_BYTES = 1024 * 1024;
 
 const handler = createMcpHandler((ctx) => {
-    const server = new McpServer({
-        name: "lunacal",
-        version: "1.0.0",
-        icons: [{ src: `${getWebappUrl()}/lunacal-icon.svg`, mimeType: "image/svg+xml" }],
-    });
-    registerLunacalTools(server, ctx.authInfo?.token);
+    const server = new McpServer(
+        {
+            name: "lunacal",
+            version: "1.1.0",
+            icons: [{ src: `${getWebappUrl()}/lunacal-icon.svg`, mimeType: "image/svg+xml" }],
+        },
+        { instructions: SERVER_INSTRUCTIONS },
+    );
+    registerLunacalTools(server, ctx.authInfo);
     return server;
 });
 
 const nodeHandler = toNodeHandler(handler);
 
-const MAX_BODY_BYTES = 1024 * 1024;
-
-const CORS_HEADERS: Record<string, string> = {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Authorization, Content-Type",
-};
-
-class RateLimiter {
-    private windows = new Map<string, { count: number; resetAt: number }>();
-    constructor(
-        private maxRequests: number,
-        private windowMs: number,
-    ) {}
-
-    check(key: string): boolean {
-        const now = Date.now();
-        const entry = this.windows.get(key);
-        if (!entry || now > entry.resetAt) {
-            this.windows.set(key, { count: 1, resetAt: now + this.windowMs });
-            return true;
-        }
-        if (entry.count >= this.maxRequests) return false;
-        entry.count++;
-        return true;
-    }
-
-    cleanup(): void {
-        const now = Date.now();
-        for (const [k, v] of this.windows) {
-            if (now > v.resetAt) this.windows.delete(k);
-        }
-    }
-}
-
 const rateLimiters = {
-    general: new RateLimiter(60, 60_000),
-    register: new RateLimiter(10, 60_000),
-    mcp: new RateLimiter(120, 60_000),
-    token: new RateLimiter(20, 60_000),
+    general: new RateLimiter(config.oauthRateLimitMax, 60_000),
+    register: new RateLimiter(config.registerRateLimitMax, 60_000),
+    token: new RateLimiter(config.oauthRateLimitMax, 60_000),
+    mcp: new RateLimiter(config.mcpRateLimitMax, 60_000),
 };
 
-setInterval(() => {
-    for (const rl of Object.values(rateLimiters)) rl.cleanup();
-}, 60_000).unref();
+const rateTimer = setInterval(() => {
+    for (const limiter of Object.values(rateLimiters)) limiter.cleanup();
+}, 60_000);
+rateTimer.unref();
 
-function getClientIp(req: IncomingMessage): string {
-    const forwarded = req.headers["x-forwarded-for"];
-    if (forwarded) {
-        const first = Array.isArray(forwarded) ? forwarded[0] : forwarded.split(",")[0];
-        return first.trim();
+const cleanupTimer = setInterval(() => {
+    cleanupExpired().catch((err: unknown) => {
+        log.error("cleanup failed", { message: err instanceof Error ? err.message : "unknown" });
+    });
+}, 5 * 60 * 1000);
+cleanupTimer.unref();
+
+function clientIp(req: IncomingMessage): string {
+    if (config.trustProxy) {
+        const forwarded = req.headers["x-forwarded-for"];
+        const raw = Array.isArray(forwarded) ? forwarded[0] : forwarded;
+        if (raw) {
+            const first = raw.split(",")[0]?.trim();
+            if (first) return first;
+        }
     }
     return req.socket.remoteAddress ?? "unknown";
+}
+
+function wwwAuthenticate(): string {
+    return `Bearer error="invalid_token", resource_metadata="${config.publicBaseUrl}/.well-known/oauth-protected-resource"`;
+}
+
+function applyCors(res: ServerResponse): void {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+    res.setHeader(
+        "Access-Control-Allow-Headers",
+        "Authorization, Content-Type, Mcp-Session-Id, Mcp-Protocol-Version, Last-Event-ID",
+    );
+    res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id, WWW-Authenticate");
+}
+
+function sendJson(res: ServerResponse, status: number, body: unknown, extra?: OutgoingHttpHeaders): void {
+    const headers: OutgoingHttpHeaders = {
+        "Content-Type": "application/json",
+        ...extra,
+    };
+    res.writeHead(status, headers).end(JSON.stringify(body));
+}
+
+function sendOAuthError(res: ServerResponse, err: OAuthError, path: string): void {
+    log.warn("oauth error", {
+        path,
+        oauthError: err.oauthError,
+        description: err.description,
+        status: err.status,
+    });
+    sendJson(res, err.status, { error: err.oauthError, error_description: err.description }, {
+        "Cache-Control": "no-store",
+        Pragma: "no-cache",
+    });
 }
 
 async function readRawBody(req: IncomingMessage): Promise<string> {
     const chunks: Buffer[] = [];
     let totalBytes = 0;
     for await (const chunk of req) {
-        totalBytes += (chunk as Buffer).length;
-        if (totalBytes > MAX_BODY_BYTES) throw new Error("Request body too large");
-        chunks.push(chunk as Buffer);
+        const buf = chunk as Buffer;
+        totalBytes += buf.length;
+        if (totalBytes > MAX_BODY_BYTES) throw new OAuthError("invalid_request", "Request body exceeds 1 MB", 400);
+        chunks.push(buf);
     }
-    return Buffer.concat(chunks).toString("utf-8");
+    return Buffer.concat(chunks).toString("utf8");
 }
 
 async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
     const raw = await readRawBody(req);
-    return raw ? JSON.parse(raw) : {};
+    if (!raw) return {};
+    try {
+        const parsed = JSON.parse(raw) as unknown;
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+            throw new OAuthError("invalid_request", "Request body must be a JSON object", 400);
+        }
+        return parsed as Record<string, unknown>;
+    } catch (err) {
+        if (err instanceof OAuthError) throw err;
+        throw new OAuthError("invalid_request", "Invalid JSON in request body", 400);
+    }
 }
 
-async function readTokenRequestBody(req: IncomingMessage): Promise<Record<string, string>> {
+async function readTokenRequestBody(req: IncomingMessage): Promise<Record<string, unknown>> {
     const raw = await readRawBody(req);
     if (!raw) return {};
     if (req.headers["content-type"]?.includes("application/json")) {
-        return JSON.parse(raw);
+        try {
+            const parsed = JSON.parse(raw) as unknown;
+            if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+                throw new OAuthError("invalid_request", "Request body must be a JSON object", 400);
+            }
+            return parsed as Record<string, unknown>;
+        } catch (err) {
+            if (err instanceof OAuthError) throw err;
+            throw new OAuthError("invalid_request", "Invalid JSON in request body", 400);
+        }
     }
     return Object.fromEntries(new URLSearchParams(raw));
 }
 
-function sendJson(res: ServerResponse, status: number, body: unknown): void {
-    res.writeHead(status, { "Content-Type": "application/json" }).end(JSON.stringify(body));
+function installUnauthorizedOverride(res: ServerResponse, store: RequestStore): void {
+    const authenticate = wwwAuthenticate();
+    const originalWriteHead = res.writeHead.bind(res);
+    const originalEnd = res.end.bind(res);
+    res.writeHead = ((statusCode: number, ...rest: unknown[]) => {
+        if (store.forceUnauthorized && !res.headersSent) {
+            res.setHeader("WWW-Authenticate", authenticate);
+            return originalWriteHead(401, ...(rest as []));
+        }
+        return originalWriteHead(statusCode, ...(rest as []));
+    }) as typeof res.writeHead;
+    res.end = ((...args: unknown[]) => {
+        if (store.forceUnauthorized && !res.headersSent) {
+            res.statusCode = 401;
+            res.setHeader("WWW-Authenticate", authenticate);
+        }
+        return originalEnd(...(args as []));
+    }) as typeof res.end;
 }
 
-createServer(async (req, res) => {
-    const url = new URL(req.url ?? "/", PUBLIC_BASE_URL);
+function sendUnauthorized(res: ServerResponse): void {
+    res.setHeader("WWW-Authenticate", wwwAuthenticate());
+    sendJson(res, 401, { error: "invalid_token" });
+}
 
-    for (const [k, v] of Object.entries(CORS_HEADERS)) res.setHeader(k, v);
+const server = createServer(async (req, res) => {
+    const url = new URL(req.url ?? "/", config.publicBaseUrl);
+    applyCors(res);
 
     if (req.method === "OPTIONS") {
         res.writeHead(204).end();
         return;
     }
 
-    const clientIp = getClientIp(req);
-    const limiter =
-        url.pathname === MCP_PATH ? rateLimiters.mcp
-        : url.pathname === "/register" ? rateLimiters.register
-        : url.pathname === "/token" ? rateLimiters.token
-        : rateLimiters.general;
-
-    if (!limiter.check(clientIp)) {
-        sendJson(res, 429, { error: "Too many requests, please try again later" });
-        return;
-    }
-
     try {
-        // --- OAuth discovery (RFC 8414) ---
-        if (url.pathname === "/.well-known/oauth-authorization-server") {
+        if (url.pathname === "/health" && req.method === "GET") {
+            try {
+                await checkDb();
+                sendJson(res, 200, { ok: true });
+            } catch (err) {
+                log.error("health check failed", { message: err instanceof Error ? err.message : "unknown" });
+                sendJson(res, 503, { ok: false });
+            }
+            return;
+        }
+
+        if (url.pathname === "/.well-known/oauth-authorization-server" && req.method === "GET") {
             sendJson(res, 200, {
-                issuer: PUBLIC_BASE_URL,
-                authorization_endpoint: `${PUBLIC_BASE_URL}/authorize`,
-                token_endpoint: `${PUBLIC_BASE_URL}/token`,
-                registration_endpoint: `${PUBLIC_BASE_URL}/register`,
+                issuer: config.publicBaseUrl,
+                authorization_endpoint: `${config.publicBaseUrl}/authorize`,
+                token_endpoint: `${config.publicBaseUrl}/token`,
+                registration_endpoint: `${config.publicBaseUrl}/register`,
                 response_types_supported: ["code"],
-                grant_types_supported: ["authorization_code"],
+                grant_types_supported: ["authorization_code", "refresh_token"],
                 code_challenge_methods_supported: ["S256"],
                 token_endpoint_auth_methods_supported: ["none"],
             });
             return;
         }
 
-        // --- OpenAI domain verification ---
-        if (url.pathname === "/.well-known/openai-apps-challenge") {
-            const token = process.env.OPENAI_DOMAIN_TOKEN ?? "";
-            res.writeHead(200, { "Content-Type": "text/plain" }).end(token);
-            return;
-        }
-
-        // --- OAuth Protected Resource Metadata (RFC 9728) ---
-        if (url.pathname === "/.well-known/oauth-protected-resource") {
+        if (url.pathname === "/.well-known/oauth-protected-resource" && req.method === "GET") {
             sendJson(res, 200, {
-                resource: `${PUBLIC_BASE_URL}/mcp`,
-                authorization_servers: [PUBLIC_BASE_URL],
+                resource: `${config.publicBaseUrl}/mcp`,
+                authorization_servers: [config.publicBaseUrl],
                 bearer_methods_supported: ["header"],
             });
             return;
         }
 
-        // --- RFC 7591 dynamic client registration ---
+        if (url.pathname === "/.well-known/openai-apps-challenge" && req.method === "GET") {
+            res.writeHead(200, { "Content-Type": "text/plain" }).end(config.openaiDomainToken);
+            return;
+        }
+
+        const ip = clientIp(req);
+        const bearer = req.headers.authorization?.startsWith("Bearer ")
+            ? req.headers.authorization.slice("Bearer ".length)
+            : undefined;
+
+        const limiter =
+            url.pathname === MCP_PATH ? rateLimiters.mcp
+            : url.pathname === "/register" ? rateLimiters.register
+            : url.pathname === "/token" ? rateLimiters.token
+            : rateLimiters.general;
+        const limitKey = url.pathname === MCP_PATH && bearer ? `mcp:${sha256(bearer)}` : `ip:${ip}:${url.pathname}`;
+        const decision = limiter.check(limitKey);
+        if (!decision.allowed) {
+            res.setHeader("Retry-After", String(decision.retryAfterSeconds));
+            sendJson(res, 429, { error: "too_many_requests", error_description: "Rate limit exceeded" });
+            return;
+        }
+
         if (url.pathname === "/register" && req.method === "POST") {
             const body = await readJsonBody(req);
-            const redirectUris = Array.isArray(body.redirect_uris) ? (body.redirect_uris as string[]) : [];
-            sendJson(res, 201, registerMcpClient({ redirect_uris: redirectUris }));
+            sendJson(res, 201, await registerMcpClient(body));
             return;
         }
 
-        // --- Step 1: MCP client sends the user's browser here ---
         if (url.pathname === "/authorize" && req.method === "GET") {
-            const target = beginAuthorization(
-                {
-                    client_id: url.searchParams.get("client_id") ?? undefined,
-                    redirect_uri: url.searchParams.get("redirect_uri") ?? undefined,
-                    state: url.searchParams.get("state") ?? undefined,
-                    code_challenge: url.searchParams.get("code_challenge") ?? undefined,
-                    code_challenge_method: url.searchParams.get("code_challenge_method") ?? undefined,
-                },
-                PUBLIC_BASE_URL,
-            );
-            res.writeHead(302, { Location: target.toString() }).end();
+            const location = await beginAuthorization({
+                client_id: url.searchParams.get("client_id") ?? undefined,
+                redirect_uri: url.searchParams.get("redirect_uri") ?? undefined,
+                state: url.searchParams.get("state") ?? undefined,
+                code_challenge: url.searchParams.get("code_challenge") ?? undefined,
+                code_challenge_method: url.searchParams.get("code_challenge_method") ?? undefined,
+                response_type: url.searchParams.get("response_type") ?? undefined,
+            });
+            res.writeHead(302, { Location: location }).end();
             return;
         }
 
-        // --- Step 2: Lunacal sends the browser back here after login+consent ---
         if (url.pathname === "/oauth/lunacal/callback" && req.method === "GET") {
-            const target = await finishLunacalAuthorization({
+            const location = await finishLunacalAuthorization({
                 code: url.searchParams.get("code") ?? undefined,
                 state: url.searchParams.get("state") ?? undefined,
+                error: url.searchParams.get("error") ?? undefined,
             });
-            res.writeHead(302, { Location: target.toString() }).end();
+            res.writeHead(302, { Location: location }).end();
             return;
         }
 
-        // --- Step 3: MCP client exchanges our code for one of our access tokens ---
         if (url.pathname === "/token" && req.method === "POST") {
             const body = await readTokenRequestBody(req);
-            sendJson(res, 200, exchangeOurCode({ code: body.code, code_verifier: body.code_verifier, client_id: body.client_id }));
+            sendJson(res, 200, await exchangeToken(body), { "Cache-Control": "no-store", Pragma: "no-cache" });
             return;
         }
 
-        // --- The actual MCP endpoint ---
         if (url.pathname === MCP_PATH) {
-            const authHeader = req.headers.authorization;
-            const bearerToken = authHeader?.startsWith("Bearer ") ? authHeader.slice("Bearer ".length) : undefined;
-
-            const lunacalToken = bearerToken ? resolveLunacalAccessToken(bearerToken) : undefined;
-            if (!lunacalToken) {
-                res.writeHead(401, {
-                    "Content-Type": "application/json",
-                    "WWW-Authenticate":
-                        `Bearer resource_metadata="${PUBLIC_BASE_URL}/.well-known/oauth-protected-resource"`,
-                });
-            
-                res.end(JSON.stringify({
-                    error: "invalid_token",
-                }));
-            
+            if (!bearer) {
+                sendUnauthorized(res);
+                return;
+            }
+            let resolved: Awaited<ReturnType<typeof resolveMcpAccess>>;
+            try {
+                resolved = await resolveMcpAccess(bearer);
+            } catch (err) {
+                if (err instanceof GrantDeadError) {
+                    sendUnauthorized(res);
+                    return;
+                }
+                if (err instanceof UpstreamTemporaryError) {
+                    log.error("mcp upstream auth failure", { message: err.message });
+                    sendJson(res, 503, { error: "temporarily_unavailable", error_description: err.message });
+                    return;
+                }
+                throw err;
+            }
+            if (!resolved) {
+                sendUnauthorized(res);
                 return;
             }
 
             (req as NodeIncomingMessageLike).auth = {
-                token: lunacalToken,
-                clientId: "lunacal-mcp",
+                token: resolved.lunacalAccessToken,
+                clientId: resolved.clientId,
                 scopes: [],
+                expiresAt: resolved.expiresAt,
+                extra: { grantId: resolved.grantId },
             } satisfies AuthInfo;
 
-            await nodeHandler(req, res);
+            const store: RequestStore = { forceUnauthorized: false };
+            installUnauthorizedOverride(res, store);
+            await requestStore.run(store, () => nodeHandler(req, res));
             return;
         }
 
         res.writeHead(404).end();
-    } catch (e) {
-        console.error("Request error:", e);
-        if (!res.headersSent) {
-            const message = e instanceof SyntaxError
-                ? "Invalid JSON in request body"
-                : e instanceof Error && e.message === "Request body too large"
-                    ? "Request body exceeds 1 MB limit"
-                    : "Unexpected server error";
-            sendJson(res, e instanceof SyntaxError ? 400 : 500, { error: message });
+    } catch (err) {
+        if (res.headersSent) {
+            log.error("request failed after headers were sent", {
+                path: url.pathname,
+                message: err instanceof Error ? err.message : "unknown",
+            });
+            return;
         }
+        if (err instanceof OAuthError) {
+            sendOAuthError(res, err, url.pathname);
+            return;
+        }
+        log.error("request failed", {
+            path: url.pathname,
+            message: err instanceof Error ? err.message : "unknown",
+        });
+        sendJson(res, 500, { error: "server_error", error_description: "Unexpected server error" });
     }
-}).listen(PORT, "0.0.0.0", () => {
-    console.log(`Lunacal MCP server listening on http://0.0.0.0:${PORT}${MCP_PATH}`);
-    console.log(`OAuth endpoints under ${PUBLIC_BASE_URL} (/authorize, /token, /register)`);
 });
 
+let shuttingDown = false;
+
+function shutdown(signal: string): void {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    log.info("shutting down", { signal });
+    clearInterval(rateTimer);
+    clearInterval(cleanupTimer);
+    server.close(() => {
+        closePool()
+            .then(() => process.exit(0))
+            .catch((err: unknown) => {
+                log.error("failed to close database pool", { message: err instanceof Error ? err.message : "unknown" });
+                process.exit(1);
+            });
+    });
+    setTimeout(() => process.exit(1), 20_000).unref();
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
+
+migrate()
+    .then(() => {
+        server.listen(config.port, "0.0.0.0", () => {
+            log.info("listening", { port: config.port, publicBaseUrl: config.publicBaseUrl });
+        });
+    })
+    .catch((err: unknown) => {
+        log.error("startup failed", { message: err instanceof Error ? err.message : "unknown" });
+        process.exit(1);
+    });

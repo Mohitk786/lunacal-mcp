@@ -2,3 +2,4 @@
 .calcom-auth/
 node_modules/
 build/
+backups/

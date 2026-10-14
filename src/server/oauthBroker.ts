@@ -1,236 +1,251 @@
-import { randomBytes, createHash } from "node:crypto";
+import { config } from "./config.js";
+import { exchangeLunacalCode } from "./lunacalOAuth.js";
+import { log } from "./log.js";
+import { lunacalAccessForGrant } from "./lunacalSession.js";
+import { OAuthError } from "./oauthErrors.js";
+import {
+    consumePending,
+    getClient,
+    insertAuthCode,
+    insertClient,
+    insertPending,
+    lookupAccessToken,
+    publicTokenResponse,
+    redeemAuthCode,
+    rotateRefreshToken,
+    type IssuedTokens,
+} from "./oauthStore.js";
 
-// OAuth broker: we are the OAuth *server* to MCP clients and the OAuth *client* to Lunacal.
-// State lives in memory — a restart drops pending logins and issued tokens.
-function getLunacalWebappUrl(): string {
-    return process.env.LUNACAL_WEBAPP_URL ?? "https://app.lunacal.ai";
-}
+const BLOCKED_SCHEMES = new Set(["javascript:", "data:", "file:", "vbscript:", "blob:"]);
+const MAX_REDIRECT_URIS = 10;
 
-interface RegisteredMcpClient {
-    clientId: string;
-    redirectUris: string[];
-}
-
-interface PendingAuthorization {
-    mcpClientId: string;
-    mcpRedirectUri: string;
-    mcpState?: string;
-    mcpCodeChallenge?: string;
-    mcpCodeChallengeMethod?: string;
-    createdAt: number;
-}
-
-interface LunacalTokens {
-    accessToken: string;
-    expiresAt: number;
-}
-
-interface OurAuthCode {
-    lunacalTokens: LunacalTokens;
-    mcpClientId: string;
-    mcpCodeChallenge: string;
-    createdAt: number;
-}
-
-const AUTH_CODE_TTL_MS = 10 * 60 * 1000; // 10 minutes
-const PENDING_AUTH_TTL_MS = 10 * 60 * 1000; // 10 minutes
-const MAX_REGISTERED_CLIENTS = 10_000;
-const CLEANUP_INTERVAL_MS = 60 * 1000; // 1 minute
-
-const mcpClients = new Map<string, RegisteredMcpClient>();
-const pendingAuthorizations = new Map<string, PendingAuthorization>();
-const ourAuthCodes = new Map<string, OurAuthCode>();
-const issuedTokens = new Map<string, LunacalTokens>();
-
-setInterval(() => {
-    const now = Date.now();
-    for (const [k, v] of pendingAuthorizations) {
-        if (now - v.createdAt > PENDING_AUTH_TTL_MS) pendingAuthorizations.delete(k);
+export function validateRedirectUri(uri: string): string | undefined {
+    if (uri.length === 0 || uri.length > 2000) return "redirect_uri is empty or too long";
+    let url: URL;
+    try {
+        url = new URL(uri);
+    } catch {
+        return "redirect_uri is not a valid URI";
     }
-    for (const [k, v] of ourAuthCodes) {
-        if (now - v.createdAt > AUTH_CODE_TTL_MS) ourAuthCodes.delete(k);
+    if (url.username || url.password) return "redirect_uri must not contain credentials";
+    if (url.hash) return "redirect_uri must not contain a fragment";
+    const protocol = url.protocol.toLowerCase();
+    if (BLOCKED_SCHEMES.has(protocol)) return `${protocol} redirect URIs are not allowed`;
+    if (protocol === "http:") {
+        const host = url.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+        if (host !== "localhost" && host !== "127.0.0.1" && host !== "::1") {
+            return "http redirect_uri is only allowed for localhost or 127.0.0.1";
+        }
+        return undefined;
     }
-    for (const [k, v] of issuedTokens) {
-        if (now > v.expiresAt) issuedTokens.delete(k);
+    if (protocol === "https:") {
+        if (!url.hostname) return "https redirect_uri needs a host";
+        return undefined;
     }
-}, CLEANUP_INTERVAL_MS).unref();
-
-function requireLunacalClientConfig(): { clientId: string; clientSecret: string } {
-    const clientId = process.env.LUNACAL_OAUTH_CLIENT_ID;
-    const clientSecret = process.env.LUNACAL_OAUTH_CLIENT_SECRET;
-    if (!clientId || !clientSecret) {
-        throw new Error(
-            "LUNACAL_OAUTH_CLIENT_ID / LUNACAL_OAUTH_CLIENT_SECRET are not set — lunacal-mcp must be " +
-                "provisioned as a Lunacal PlatformOAuthClient first (see provisioning script).",
-        );
-    }
-    return { clientId, clientSecret };
+    if (!/^[a-z][a-z0-9+.-]*:$/.test(protocol)) return "invalid redirect_uri scheme";
+    return undefined;
 }
 
-function randomToken(bytes = 32): string {
-    return randomBytes(bytes).toString("base64url");
+function errorRedirect(redirectUri: string, error: string, description: string, state?: string | null): string {
+    const url = new URL(redirectUri);
+    url.searchParams.set("error", error);
+    url.searchParams.set("error_description", description);
+    if (state) url.searchParams.set("state", state);
+    return url.toString();
 }
 
-/** S256 PKCE check: base64url(sha256(verifier)) === challenge. */
-function verifyPkce(verifier: string, challenge: string): boolean {
-    const computed = createHash("sha256").update(verifier).digest("base64url");
-    return computed === challenge;
-}
-
-export function ourCallbackUrl(publicBaseUrl: string): string {
-    return `${publicBaseUrl}/oauth/lunacal/callback`;
-}
-
-export function registerMcpClient(body: { redirect_uris?: string[] }): {
+export async function registerMcpClient(body: {
+    redirect_uris?: unknown;
+    client_name?: unknown;
+}): Promise<{
     client_id: string;
     redirect_uris: string[];
+    client_name?: string;
+    grant_types: ["authorization_code", "refresh_token"];
+    response_types: ["code"];
     token_endpoint_auth_method: "none";
-} {
-    if (mcpClients.size >= MAX_REGISTERED_CLIENTS) {
-        throw new Error("Too many registered clients");
+    client_id_issued_at: number;
+}> {
+    if (!Array.isArray(body.redirect_uris) || body.redirect_uris.length === 0) {
+        throw new OAuthError("invalid_request", "redirect_uris must be a non-empty array", 400);
     }
-    const clientId = randomToken(16);
-    const redirectUris = body.redirect_uris ?? [];
-    mcpClients.set(clientId, { clientId, redirectUris });
-    return { client_id: clientId, redirect_uris: redirectUris, token_endpoint_auth_method: "none" };
+    if (body.redirect_uris.length > MAX_REDIRECT_URIS) {
+        throw new OAuthError("invalid_request", `At most ${MAX_REDIRECT_URIS} redirect_uris are allowed`, 400);
+    }
+    const redirectUris: string[] = [];
+    for (const uri of body.redirect_uris) {
+        if (typeof uri !== "string") {
+            throw new OAuthError("invalid_request", "Each redirect_uri must be a string", 400);
+        }
+        const problem = validateRedirectUri(uri);
+        if (problem) throw new OAuthError("invalid_redirect_uri", problem, 400);
+        redirectUris.push(uri);
+    }
+    const clientName = typeof body.client_name === "string" ? body.client_name.slice(0, 256) : null;
+    const client = await insertClient({ redirectUris, clientName });
+    log.info("registered oauth client", { clientId: client.clientId });
+    return {
+        client_id: client.clientId,
+        redirect_uris: client.redirectUris,
+        ...(client.clientName ? { client_name: client.clientName } : {}),
+        grant_types: ["authorization_code", "refresh_token"],
+        response_types: ["code"],
+        token_endpoint_auth_method: "none",
+        client_id_issued_at: Math.floor(client.createdAt.getTime() / 1000),
+    };
 }
 
-export function beginAuthorization(
-    params: {
-        client_id?: string;
-        redirect_uri?: string;
-        state?: string;
-        code_challenge?: string;
-        code_challenge_method?: string;
-    },
-    publicBaseUrl: string,
-): URL {
-    requireLunacalClientConfig();
-
-    if (!params.client_id) {
-        throw new Error("client_id is required");
+export async function beginAuthorization(params: {
+    client_id?: string;
+    redirect_uri?: string;
+    state?: string;
+    code_challenge?: string;
+    code_challenge_method?: string;
+    response_type?: string;
+}): Promise<string> {
+    if (!params.client_id || !params.redirect_uri) {
+        throw new OAuthError("invalid_request", "client_id and redirect_uri are required", 400);
     }
-    if (!params.redirect_uri) {
-        throw new Error("redirect_uri is required");
+    if (params.client_id.length > 256 || params.redirect_uri.length > 2000) {
+        throw new OAuthError("invalid_request", "client_id or redirect_uri is too long", 400);
     }
-    // Auto-register if client_id was lost on restart but the MCP client cached it.
-    if (!mcpClients.has(params.client_id)) {
-        mcpClients.set(params.client_id, { clientId: params.client_id, redirectUris: [params.redirect_uri] });
+    const client = await getClient(params.client_id);
+    if (!client) {
+        throw new OAuthError("invalid_request", "Unknown client_id", 400);
     }
-    if (!mcpClients.get(params.client_id)!.redirectUris.includes(params.redirect_uri)) {
-        throw new Error("redirect_uri does not match a registered redirect_uri for this client");
+    if (!client.redirectUris.includes(params.redirect_uri)) {
+        throw new OAuthError("invalid_request", "redirect_uri is not registered for this client", 400);
+    }
+    if (params.response_type && params.response_type !== "code") {
+        return errorRedirect(
+            params.redirect_uri,
+            "unsupported_response_type",
+            "Only response_type=code is supported",
+            params.state,
+        );
+    }
+    if (params.state && params.state.length > 2000) {
+        return errorRedirect(params.redirect_uri, "invalid_request", "state is too long", params.state);
     }
     if (!params.code_challenge || params.code_challenge_method !== "S256") {
-        throw new Error("PKCE with S256 is required");
+        return errorRedirect(params.redirect_uri, "invalid_request", "PKCE with S256 is required", params.state);
+    }
+    if (params.code_challenge.length > 256) {
+        return errorRedirect(params.redirect_uri, "invalid_request", "code_challenge is too long", params.state);
     }
 
-    const ourState = randomToken();
-    pendingAuthorizations.set(ourState, {
-        mcpClientId: params.client_id,
-        mcpRedirectUri: params.redirect_uri,
-        mcpState: params.state,
-        mcpCodeChallenge: params.code_challenge,
-        mcpCodeChallengeMethod: params.code_challenge_method,
-        createdAt: Date.now(),
+    const state = await insertPending({
+        clientId: params.client_id,
+        redirectUri: params.redirect_uri,
+        clientState: params.state ?? null,
+        codeChallenge: params.code_challenge,
     });
-
-    const url = new URL(`${getLunacalWebappUrl()}/auth/platform/authorize`);
-    url.searchParams.set("redirect_uri", ourCallbackUrl(publicBaseUrl));
-    url.searchParams.set("state", ourState);
-    return url;
+    const url = new URL(`${config.lunacalWebappUrl}/auth/platform/authorize`);
+    url.searchParams.set("redirect_uri", `${config.publicBaseUrl}/oauth/lunacal/callback`);
+    url.searchParams.set("state", state);
+    return url.toString();
 }
 
-export async function finishLunacalAuthorization(query: { code?: string; state?: string }): Promise<URL> {
-    if (!query.code || !query.state) {
-        throw new Error("Missing code or state on Lunacal callback");
+export async function finishLunacalAuthorization(query: {
+    code?: string;
+    state?: string;
+    error?: string;
+}): Promise<string> {
+    if (!query.state) {
+        throw new OAuthError("invalid_request", "Missing state on Lunacal callback", 400);
     }
-    const pending = pendingAuthorizations.get(query.state);
+    const pending = await consumePending(query.state);
     if (!pending) {
-        throw new Error("Unknown or expired state on Lunacal callback");
+        throw new OAuthError("invalid_request", "Unknown or expired state on Lunacal callback", 400);
     }
-    pendingAuthorizations.delete(query.state);
-
-    const { clientSecret } = requireLunacalClientConfig();
-    const res = await fetch(`${getLunacalWebappUrl()}/api/mcp/token`, {
-        method: "POST",
-        headers: {
-            Authorization: `Bearer ${query.code}`,
-            "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ clientSecret }),
-    });
-    if (!res.ok) {
-        throw new Error(`Lunacal token exchange failed: ${res.status} ${await res.text()}`);
+    if (query.error || !query.code) {
+        return errorRedirect(
+            pending.redirectUri,
+            query.error ?? "access_denied",
+            "Lunacal did not return an authorization code",
+            pending.clientState,
+        );
     }
-    const { accessToken, expiresAt } = (await res.json()) as {
-        accessToken: string;
-        expiresAt: string;
-    };
 
-    const ourCode = randomToken();
-    ourAuthCodes.set(ourCode, {
-        lunacalTokens: {
-            accessToken,
-            expiresAt: new Date(expiresAt).getTime(),
-        },
-        mcpClientId: pending.mcpClientId,
-        mcpCodeChallenge: pending.mcpCodeChallenge!,
-        createdAt: Date.now(),
-    });
-
-    const redirectUrl = new URL(pending.mcpRedirectUri);
-    redirectUrl.searchParams.set("code", ourCode);
-    if (pending.mcpState) {
-        redirectUrl.searchParams.set("state", pending.mcpState);
+    try {
+        const tokens = await exchangeLunacalCode(query.code);
+        const ourCode = await insertAuthCode({
+            clientId: pending.clientId,
+            redirectUri: pending.redirectUri,
+            codeChallenge: pending.codeChallenge,
+            lunacalAccessToken: tokens.accessToken,
+            lunacalRefreshToken: tokens.refreshToken,
+            lunacalExpiresAt: tokens.expiresAt,
+            lunacalRefreshExpiresAt: tokens.refreshTokenExpiresAt,
+        });
+        const url = new URL(pending.redirectUri);
+        url.searchParams.set("code", ourCode);
+        if (pending.clientState) url.searchParams.set("state", pending.clientState);
+        return url.toString();
+    } catch (err) {
+        log.error("lunacal callback failed", { message: err instanceof Error ? err.message : "unknown" });
+        return errorRedirect(
+            pending.redirectUri,
+            "server_error",
+            "Login could not be completed. Try connecting again.",
+            pending.clientState,
+        );
     }
-    return redirectUrl;
 }
 
-export function exchangeOurCode(body: { code?: string; code_verifier?: string; client_id?: string }): {
+function asString(body: Record<string, unknown>, key: string): string | undefined {
+    const value = body[key];
+    return typeof value === "string" ? value : undefined;
+}
+
+export async function exchangeToken(body: Record<string, unknown>): Promise<{
     access_token: string;
     token_type: "bearer";
     expires_in: number;
-} {
-    if (!body.code) {
-        throw new Error("Missing code");
-    }
-    if (!body.client_id) {
-        throw new Error("Missing client_id");
-    }
-    const entry = ourAuthCodes.get(body.code);
-    if (!entry) {
-        throw new Error("Unknown or already-used code");
-    }
-    ourAuthCodes.delete(body.code);
+    refresh_token: string;
+}> {
+    const grantType = asString(body, "grant_type");
+    const clientId = asString(body, "client_id");
+    if (!grantType) throw new OAuthError("invalid_request", "grant_type is required", 400);
+    if (!clientId) throw new OAuthError("invalid_request", "client_id is required", 400);
 
-    if (entry.mcpClientId !== body.client_id) {
-        throw new Error("client_id does not match the authorization request");
+    let issued: IssuedTokens;
+    if (grantType === "authorization_code") {
+        const code = asString(body, "code");
+        if (!code) throw new OAuthError("invalid_request", "code is required", 400);
+        issued = await redeemAuthCode({
+            code,
+            clientId,
+            codeVerifier: asString(body, "code_verifier"),
+            redirectUri: asString(body, "redirect_uri"),
+        });
+    } else if (grantType === "refresh_token") {
+        const refreshToken = asString(body, "refresh_token");
+        if (!refreshToken) throw new OAuthError("invalid_request", "refresh_token is required", 400);
+        issued = await rotateRefreshToken(refreshToken, clientId);
+    } else {
+        throw new OAuthError(
+            "unsupported_grant_type",
+            "Only authorization_code and refresh_token are supported",
+            400,
+        );
     }
-
-    if (Date.now() - entry.createdAt > AUTH_CODE_TTL_MS) {
-        throw new Error("Authorization code expired");
-    }
-
-    if (!body.code_verifier || !verifyPkce(body.code_verifier, entry.mcpCodeChallenge)) {
-        throw new Error("PKCE verification failed");
-    }
-
-    const ourAccessToken = randomToken();
-    issuedTokens.set(ourAccessToken, entry.lunacalTokens);
-
-    return {
-        access_token: ourAccessToken,
-        token_type: "bearer",
-        expires_in: Math.max(0, Math.floor((entry.lunacalTokens.expiresAt - Date.now()) / 1000)),
-    };
+    return publicTokenResponse(issued);
 }
 
-export function resolveLunacalAccessToken(ourAccessToken: string): string | undefined {
-    const entry = issuedTokens.get(ourAccessToken);
-    if (!entry) return undefined;
-    if (Date.now() > entry.expiresAt) {
-        issuedTokens.delete(ourAccessToken);
-        return undefined;
-    }
-    return entry.accessToken;
+export async function resolveMcpAccess(ourAccessToken: string): Promise<{
+    lunacalAccessToken: string;
+    grantId: string;
+    clientId: string;
+    expiresAt: number;
+} | undefined> {
+    const row = await lookupAccessToken(ourAccessToken);
+    if (!row) return undefined;
+    const lunacalAccessToken = await lunacalAccessForGrant(row.grantId);
+    return {
+        lunacalAccessToken,
+        grantId: row.grantId,
+        clientId: row.clientId,
+        expiresAt: Math.floor(row.expiresAt.getTime() / 1000),
+    };
 }

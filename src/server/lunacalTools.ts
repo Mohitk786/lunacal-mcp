@@ -1,56 +1,115 @@
 import { z } from "zod";
-import type { McpServer } from "@modelcontextprotocol/server";
+import type { AuthInfo, McpServer } from "@modelcontextprotocol/server";
 import { callLunacalMcpApi, LunacalApiError } from "./lunacalApiClient.js";
+import { lunacalAccessForGrant } from "./lunacalSession.js";
+import { GrantDeadError, UpstreamTemporaryError } from "./oauthErrors.js";
+import { requestStore } from "./requestContext.js";
 
 type ToolResult = {
     content: { type: "text"; text: string }[];
     isError?: boolean;
 };
 
-function ok(data: unknown): ToolResult {
-    return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
-}
+const isoDateTime = z
+    .string()
+    .regex(
+        /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/,
+        "ISO 8601 datetime with a timezone offset, for example 2026-10-13T15:00:00-04:00",
+    );
 
-function err(e: unknown): ToolResult {
-    if (e instanceof LunacalApiError) {
-        return {
-            isError: true,
-            content: [{ type: "text", text: `Lunacal API error ${e.status}: ${JSON.stringify(e.body)}` }],
-        };
-    }
+const timezone = z.string().min(1).describe('IANA timezone, for example "America/New_York"');
+
+const HINTS: Record<string, string> = {
+    no_available_users_found_error:
+        "That time is not available. Call find_available_slots for this event type and timezone, then book one of the returned slots.",
+    hosts_unavailable_for_booking:
+        "No host is free at that time. Call find_available_slots and choose an open slot.",
+    booking_conflict: "That slot was just taken. Call find_available_slots and choose a different open slot.",
+    booking_seats_full_error: "That slot has no seats left. Call find_available_slots and choose another slot.",
+    not_enough_available_seats_error: "Not enough seats left. Call find_available_slots and choose another slot.",
+    event_type_not_found_error: "No event type with that id. Call list_event_types and use an id from the result.",
+    booking_not_found_error: "No booking with that uid. Call list_bookings and use a uid from the result.",
+    cancelled_bookings_cannot_be_rescheduled: "That booking is already cancelled and cannot be rescheduled.",
+    availability_not_found_in_schedule_error:
+        "The event type's schedule has no availability. This server cannot edit weekly schedules.",
+    cancellation_reason_required_error:
+        "This booking requires cancellationReason. Ask the user for a reason and call cancel_booking again.",
+    cancellation_not_allowed_past_deadline_error: "The cancellation deadline for this booking has passed.",
+};
+
+function textResult(data: unknown, isError = false): ToolResult {
+    const text = typeof data === "string" ? data : JSON.stringify(data);
     return {
-        isError: true,
-        content: [{ type: "text", text: e instanceof Error ? e.message : String(e) }],
+        ...(isError ? { isError: true } : {}),
+        content: [{ type: "text", text }],
     };
 }
 
-interface LunacalTool {
-    name: string;
-    title: string;
-    description: string;
-    inputSchema: z.ZodType;
-    annotations: {
-        readOnlyHint: boolean;
-        destructiveHint: boolean;
-        openWorldHint: boolean;
-    };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    handler: (args: any, accessToken: string) => Promise<ToolResult>;
+function apiMessage(body: unknown): string {
+    if (!body || typeof body !== "object") return "Request failed";
+    const record = body as Record<string, unknown>;
+    if (typeof record.message === "string") return record.message;
+    if (typeof record.error === "string") return record.error;
+    return "Request failed";
 }
 
-/**
- * Matches `bookingResponses` (packages/prisma/zod-utils.ts) exactly — the
- * schema handleNewBooking actually validates attendee fields against. These
- * live NESTED under `responses` on the booking body, not flat on it.
- *
- * `bookingResponses` is only the BASE shape — the real schema used at runtime
- * is `bookingResponses.and(z.record(z.any()))` (getBookingResponsesSchema),
- * an intersection that also accepts one key per CUSTOM booking question the
- * host configured on the event type (keyed by that question's own field
- * name, from eventType.bookingFields — see getEventTypeById). Required
- * custom questions will fail validation if missing, so `additionalResponses`
- * carries those through untouched.
- */
+function formatApiError(error: LunacalApiError): string {
+    const message = apiMessage(error.body);
+    const hint = Object.entries(HINTS).find(([code]) => message.includes(code))?.[1];
+    return hint ? `${message}. ${hint}` : `Lunacal API error (${error.status}): ${message}`;
+}
+
+type ToolCtx = { accessToken: string; grantId: string };
+
+function markReconnect(): void {
+    const store = requestStore.getStore();
+    if (store) store.forceUnauthorized = true;
+}
+
+async function withLunacal<T>(ctx: ToolCtx, readOnly: boolean, run: (accessToken: string) => Promise<T>): Promise<T> {
+    try {
+        return await run(ctx.accessToken);
+    } catch (err) {
+        if (!(err instanceof LunacalApiError) || err.status !== 401) throw err;
+        let fresh: string;
+        try {
+            fresh = await lunacalAccessForGrant(ctx.grantId, ctx.accessToken);
+        } catch (refreshErr) {
+            if (refreshErr instanceof GrantDeadError) {
+                markReconnect();
+                throw new Error("Lunacal rejected this session. The user must reconnect.");
+            }
+            if (refreshErr instanceof UpstreamTemporaryError) {
+                throw new Error(
+                    "Lunacal could not refresh the session because of a temporary error. Retry shortly. The user does not need to reconnect.",
+                );
+            }
+            throw refreshErr;
+        }
+        if (fresh !== ctx.accessToken) {
+            if (!readOnly) {
+                throw new Error("Lunacal rejected the access token and a new one was issued. Retry this tool call.");
+            }
+            try {
+                return await run(fresh);
+            } catch (retryErr) {
+                if (retryErr instanceof LunacalApiError && retryErr.status === 401) {
+                    markReconnect();
+                    throw new Error("Lunacal rejected this session. The user must reconnect.");
+                }
+                throw retryErr;
+            }
+        }
+        markReconnect();
+        throw new Error("Lunacal rejected this session. The user must reconnect.");
+    }
+}
+
+function fail(err: unknown): ToolResult {
+    if (err instanceof LunacalApiError) return textResult(formatApiError(err), true);
+    return textResult(err instanceof Error ? err.message : "Request failed", true);
+}
+
 function buildBookingResponses(fields: {
     name?: string;
     email?: string;
@@ -72,447 +131,457 @@ function buildBookingResponses(fields: {
     };
 }
 
-/**
- * Every tool this server exposes, as plain data. Each calls one of
- * lunacal-mcp's dedicated routes on the Lunacal webapp
- * (apps/web/pages/api/mcp/*), which in turn call the same tRPC procedures /
- * booking handlers the app's own UI uses — not a REST API, since Lunacal has
- * never deployed one (apps/api/v1/v2 exist in source but aren't run).
- */
-export const lunacalTools: LunacalTool[] = [
+function slimBookingFields(value: unknown): unknown {
+    if (!Array.isArray(value)) return undefined;
+    return value.map((field) => {
+        if (!field || typeof field !== "object") return field;
+        const record = field as Record<string, unknown>;
+        return {
+            name: record.name,
+            type: record.type,
+            required: record.required,
+            label: record.label,
+        };
+    });
+}
+
+function slimEventType(value: unknown, teamId?: unknown): unknown {
+    if (!value || typeof value !== "object") return value;
+    const eventType = value as Record<string, unknown>;
+    if (eventType.id == null) return value;
+    return {
+        id: eventType.id,
+        title: eventType.title,
+        slug: eventType.slug,
+        length: eventType.length,
+        description: typeof eventType.description === "string" ? eventType.description.slice(0, 500) : eventType.description,
+        teamId: eventType.teamId ?? teamId ?? null,
+        scheduleId: eventType.scheduleId ?? null,
+        hidden: eventType.hidden,
+        locations: eventType.locations,
+        requiresConfirmation: eventType.requiresConfirmation,
+        bookingFields: slimBookingFields(eventType.bookingFields),
+    };
+}
+
+function flattenEventTypes(payload: unknown): unknown {
+    if (!payload || typeof payload !== "object") return payload;
+    const groups = (payload as { eventTypeGroups?: unknown }).eventTypeGroups;
+    if (!Array.isArray(groups)) return payload;
+    return groups.flatMap((group) => {
+        if (!group || typeof group !== "object") return [];
+        const record = group as { teamId?: unknown; eventTypes?: unknown[] };
+        return (record.eventTypes ?? []).map((eventType) => slimEventType(eventType, record.teamId));
+    });
+}
+
+function slimBooking(value: unknown): unknown {
+    if (!value || typeof value !== "object") return value;
+    const booking = value as Record<string, unknown>;
+    if (typeof booking.uid !== "string" && booking.id == null) return value;
+    const attendees = Array.isArray(booking.attendees)
+        ? booking.attendees.map((attendee) => {
+              if (!attendee || typeof attendee !== "object") return attendee;
+              const record = attendee as Record<string, unknown>;
+              return { name: record.name, email: record.email, timeZone: record.timeZone };
+          })
+        : undefined;
+    return {
+        id: booking.id,
+        uid: booking.uid,
+        title: booking.title,
+        status: booking.status,
+        start: booking.startTime ?? booking.start,
+        end: booking.endTime ?? booking.end,
+        eventTypeId: booking.eventTypeId ?? (booking.eventType as { id?: unknown } | undefined)?.id,
+        attendees,
+    };
+}
+
+function slimBookings(payload: unknown): unknown {
+    if (Array.isArray(payload)) return payload.map(slimBooking);
+    if (!payload || typeof payload !== "object") return payload;
+    const record = payload as Record<string, unknown>;
+    if (Array.isArray(record.bookings)) {
+        return { ...record, bookings: record.bookings.map(slimBooking) };
+    }
+    return slimBooking(payload);
+}
+
+function slimProfile(payload: unknown): unknown {
+    if (!payload || typeof payload !== "object") return payload;
+    const profile = payload as Record<string, unknown>;
+    const picked = {
+        id: profile.id,
+        name: profile.name,
+        email: profile.email,
+        username: profile.username,
+        timeZone: profile.timeZone,
+        weekStart: profile.weekStart,
+        locale: profile.locale,
+        defaultScheduleId: profile.defaultScheduleId,
+    };
+    return Object.values(picked).some((value) => value !== undefined) ? picked : payload;
+}
+
+type ToolDef = {
+    name: string;
+    title: string;
+    description: string;
+    inputSchema: z.ZodType;
+    readOnly: boolean;
+    destructive: boolean;
+    handler: (args: Record<string, unknown>, ctx: ToolCtx) => Promise<ToolResult>;
+};
+
+const tools: ToolDef[] = [
     {
-        name: "getMe",
+        name: "get_my_profile",
         title: "Get my profile",
         description:
-            "Get the authenticated user's own Lunacal profile: name, email, username, timezone, subscription " +
-            "and voice-agent-subscription state, team/event-type counts, feature flags, and more.",
-        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-        inputSchema: z.object({
-            includePasswordAdded: z.boolean().optional(),
-            includeSubscription: z.boolean().optional(),
-        }),
-        handler: async (body, accessToken) => {
-            try {
-                return ok(await callLunacalMcpApi("/me", accessToken, body));
-            } catch (e) {
-                return err(e);
-            }
+            "Get the signed-in user's Lunacal profile: name, email, username, and timezone. " +
+            "Call this when you need the user's timezone before searching for slots.",
+        readOnly: true,
+        destructive: false,
+        inputSchema: z.object({}),
+        handler: async (_args, ctx) => {
+            const profile = await withLunacal(ctx, true, (token) => callLunacalMcpApi("/me", token, {}));
+            return textResult(slimProfile(profile));
         },
     },
-
     {
-        name: "getBookings",
-        title: "List bookings",
-        description: "List the authenticated user's Lunacal bookings. `status` is required by the underlying API.",
-        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-        inputSchema: z.object({
-            status: z.enum(["upcoming", "recurring", "past", "cancelled", "unconfirmed"]),
-            teamIds: z.array(z.coerce.number().int()).optional(),
-            eventTypeIds: z.array(z.coerce.number().int()).optional(),
-            search: z.string().optional(),
-            startDate: z.string().datetime().optional(),
-            endDate: z.string().datetime().optional(),
-            attendeeEmail: z.string().email().optional(),
-            limit: z.coerce.number().int().min(1).max(100).optional(),
-            cursor: z.coerce.number().int().optional().describe("Offset into the result set, from a previous call's nextCursor"),
-        }),
-        handler: async ({ status, teamIds, eventTypeIds, search, startDate, endDate, attendeeEmail, limit, cursor }, accessToken) => {
-            try {
-                return ok(
-                    await callLunacalMcpApi("/bookings/list", accessToken, {
-                        filters: { status, teamIds, eventTypeIds, search, startDate, endDate, attendeeEmail },
-                        limit,
-                        cursor,
-                    }),
-                );
-            } catch (e) {
-                return err(e);
-            }
-        },
-    },
-
-    {
-        name: "getAvailability",
-        title: "Get availability",
-        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+        name: "list_event_types",
+        title: "List event types",
         description:
-            "Get an event type's available booking slots in a time range. Always call this before " +
-            "createBooking/rescheduleBooking to confirm a slot is actually free — neither of those tools " +
-            "checks availability itself. Identify the event type by eventTypeId, OR by eventTypeSlug " +
-            "combined with usernameList (the host's username, as a single-element array for an individual).",
+            "List the user's event types (personal and team). Use an id from this list with find_available_slots " +
+            "and create_booking. scheduleId is informational; weekly hours cannot be edited with this server.",
+        readOnly: true,
+        destructive: false,
         inputSchema: z.object({
-            startTime: z.string().describe("ISO 8601 range start"),
-            endTime: z.string().describe("ISO 8601 range end"),
+            teamIds: z.array(z.coerce.number().int()).optional(),
+            slug: z.string().optional().describe("Keep only event types with this slug"),
+        }),
+        handler: async (args, ctx) => {
+            const teamIds = args.teamIds as number[] | undefined;
+            const slug = args.slug as string | undefined;
+            const payload = await withLunacal(ctx, true, (token) =>
+                callLunacalMcpApi("/event-types/list", token, teamIds ? { filters: { teamIds } } : {}),
+            );
+            const eventTypes = flattenEventTypes(payload);
+            if (!Array.isArray(eventTypes) || !slug) return textResult(eventTypes);
+            return textResult(eventTypes.filter((eventType) => (eventType as { slug?: string }).slug === slug));
+        },
+    },
+    {
+        name: "get_event_type",
+        title: "Get event type",
+        description:
+            "Get one event type by numeric id, including locations and bookingFields. " +
+            "Required booking questions must be answered in create_booking additionalResponses, keyed by field name.",
+        readOnly: true,
+        destructive: false,
+        inputSchema: z.object({ id: z.coerce.number().int() }),
+        handler: async (args, ctx) => {
+            const payload = await withLunacal(ctx, true, (token) =>
+                callLunacalMcpApi("/event-types/get", token, { id: args.id }),
+            );
+            return textResult(slimEventType(payload));
+        },
+    },
+    {
+        name: "find_available_slots",
+        title: "Find available slots",
+        description:
+            "Find open booking slots for an event type between start and end. " +
+            "Call this before create_booking or reschedule_booking. Identify the event type by eventTypeId, " +
+            "or by eventTypeSlug plus usernameList. Times must include a timezone offset, and timezone is required.",
+        readOnly: true,
+        destructive: false,
+        inputSchema: z.object({
+            startTime: isoDateTime.describe("Range start"),
+            endTime: isoDateTime.describe("Range end"),
+            timezone,
             eventTypeId: z.coerce.number().int().optional(),
             eventTypeSlug: z.string().optional().describe("Requires usernameList when used instead of eventTypeId"),
             usernameList: z.array(z.string()).min(1).optional().describe("Host username(s); pairs with eventTypeSlug"),
-            timeZone: z.string().optional().describe("Invitee time zone; slots are returned relative to it"),
-            duration: z.coerce.number().int().optional().describe("For event types with multiple duration options"),
-            rescheduleUid: z.string().optional().describe("Excludes the booking being rescheduled from conflicts"),
-            isTeamEvent: z.boolean().optional(),
-            orgSlug: z.string().optional(),
+            duration: z.coerce.number().int().optional().describe("For event types that offer more than one duration"),
+            rescheduleUid: z.string().optional().describe("Exclude the booking being rescheduled from conflicts"),
         }),
-        handler: async (body, accessToken) => {
-            try {
-                return ok(await callLunacalMcpApi("/get-availability", accessToken, body));
-            } catch (e) {
-                return err(e);
-            }
+        handler: async (args, ctx) => {
+            const payload = await withLunacal(ctx, true, (token) =>
+                callLunacalMcpApi("/get-availability", token, {
+                    startTime: args.startTime,
+                    endTime: args.endTime,
+                    timeZone: args.timezone,
+                    eventTypeId: args.eventTypeId,
+                    eventTypeSlug: args.eventTypeSlug,
+                    usernameList: args.usernameList,
+                    duration: args.duration,
+                    rescheduleUid: args.rescheduleUid,
+                }),
+            );
+            return textResult(payload);
         },
     },
-
     {
-        name: "createBooking",
-        title: "Create booking",
-        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+        name: "list_bookings",
+        title: "List bookings",
         description:
-            "Create a new booking against a Lunacal event type. Call getAvailability first to confirm the " +
-            "slot is actually free — this does not check availability itself. If the event type has custom " +
-            "booking questions (check eventType.bookingFields via getEventTypeById), answer required ones " +
-            "via additionalResponses or the booking will fail validation.",
+            "List the user's bookings. status is required. Pass limit (default 20, max 100) and cursor from a " +
+            "previous nextCursor for the next page. Use a booking uid from this list to reschedule or cancel.",
+        readOnly: true,
+        destructive: false,
+        inputSchema: z.object({
+            status: z.enum(["upcoming", "recurring", "past", "cancelled", "unconfirmed"]),
+            timezone: timezone.optional().describe("How to interpret startDate and endDate when they are local times"),
+            teamIds: z.array(z.coerce.number().int()).optional(),
+            eventTypeIds: z.array(z.coerce.number().int()).optional(),
+            search: z.string().optional(),
+            startDate: isoDateTime.optional(),
+            endDate: isoDateTime.optional(),
+            attendeeEmail: z.string().optional(),
+            limit: z.coerce.number().int().min(1).max(100).default(20),
+            cursor: z.coerce.number().int().optional().describe("Offset from a previous response's nextCursor"),
+        }),
+        handler: async (args, ctx) => {
+            const payload = await withLunacal(ctx, true, (token) =>
+                callLunacalMcpApi("/bookings/list", token, {
+                    filters: {
+                        status: args.status,
+                        teamIds: args.teamIds,
+                        eventTypeIds: args.eventTypeIds,
+                        search: args.search,
+                        startDate: args.startDate,
+                        endDate: args.endDate,
+                        attendeeEmail: args.attendeeEmail,
+                    },
+                    limit: args.limit,
+                    cursor: args.cursor,
+                }),
+            );
+            return textResult(slimBookings(payload));
+        },
+    },
+    {
+        name: "create_booking",
+        title: "Create booking",
+        description:
+            "Book a slot on an event type. Call find_available_slots first and pass one of those start times. " +
+            "If the event type has required bookingFields from get_event_type, put the answers in additionalResponses " +
+            "keyed by each field's name. This does not check availability itself.",
+        readOnly: false,
+        destructive: false,
         inputSchema: z.object({
             eventTypeId: z.coerce.number().int(),
-            start: z.string().describe("ISO 8601 start time"),
-            end: z.string().optional().describe("ISO 8601 end time"),
-            timeZone: z.string().describe('IANA time zone, e.g. "America/New_York"'),
+            start: isoDateTime,
+            end: isoDateTime.optional(),
+            timezone,
             name: z.string().describe("Attendee name"),
             email: z.string().describe("Attendee email"),
             guests: z.array(z.string()).optional().describe("Additional guest emails"),
             notes: z.string().optional(),
-            location: z.string().optional().describe('Selected location value, e.g. "inPerson" or a link'),
+            location: z.string().optional().describe('Selected location value, for example "integrations:daily" or an address'),
             additionalResponses: z
                 .record(z.string(), z.unknown())
                 .optional()
-                .describe(
-                    "Answers to the event type's own custom booking questions, keyed by each question's " +
-                        "field name exactly as it appears in eventType.bookingFields (from getEventTypeById) — " +
-                        "e.g. { companyName: \"Acme\" }. Required questions fail the booking if omitted.",
-                ),
+                .describe("Answers to custom booking questions, keyed by bookingFields.name"),
             language: z.string().default("en"),
             metadata: z.record(z.string(), z.string()).default({}),
         }),
-        handler: async (
-            { eventTypeId, start, end, timeZone, name, email, guests, notes, location, additionalResponses, language, metadata },
-            accessToken,
-        ) => {
-            try {
-                return ok(
-                    await callLunacalMcpApi("/bookings/create", accessToken, {
-                        eventTypeId,
-                        start,
-                        end,
-                        timeZone,
-                        language,
-                        metadata,
-                        // handleNewBooking validates against extendedBookingCreateBody.merge({responses: ...})
-                        // (packages/features/bookings/lib/getBookingDataSchema.ts) — attendee fields live
-                        // NESTED under `responses` (packages/prisma/zod-utils.ts's `bookingResponses`
-                        // schema), not flat on the body. location, if set, must be {value, optionValue}.
-                        responses: buildBookingResponses({ name, email, guests, notes, location, additionalResponses }),
-                        // Same schema requires these two recurring-booking fields with no .optional() —
-                        // empty arrays satisfy validation for a normal, non-recurring booking.
-                        bookingUids: [],
-                        slots: [],
+        handler: async (args, ctx) => {
+            const payload = await withLunacal(ctx, false, (token) =>
+                callLunacalMcpApi("/bookings/create", token, {
+                    eventTypeId: args.eventTypeId,
+                    start: args.start,
+                    end: args.end,
+                    timeZone: args.timezone,
+                    language: args.language,
+                    metadata: args.metadata,
+                    responses: buildBookingResponses({
+                        name: args.name as string,
+                        email: args.email as string,
+                        guests: args.guests as string[] | undefined,
+                        notes: args.notes as string | undefined,
+                        location: args.location as string | undefined,
+                        additionalResponses: args.additionalResponses as Record<string, unknown> | undefined,
                     }),
-                );
-            } catch (e) {
-                return err(e);
-            }
+                    bookingUids: [],
+                    slots: [],
+                }),
+            );
+            return textResult(slimBooking(payload));
         },
     },
-
     {
-        name: "rescheduleBooking",
+        name: "reschedule_booking",
         title: "Reschedule booking",
-        annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
         description:
-            "Reschedule an existing booking to a new time. There is no dedicated reschedule endpoint — " +
-            "this goes through the same create-booking path with rescheduleUid set, which is the real " +
-            "reschedule path. Call getAvailability first to confirm the new slot is actually free. If the " +
-            "event type has custom booking questions, answer required ones via additionalResponses.",
+            "Move an existing booking to a new start time. Call find_available_slots with rescheduleUid first. " +
+            "Requires the booking uid from list_bookings, the event type id, and the attendee name and email.",
+        readOnly: false,
+        destructive: false,
         inputSchema: z.object({
-            rescheduleUid: z.string().describe("The uid of the booking being rescheduled"),
+            rescheduleUid: z.string().describe("uid of the booking to move"),
             eventTypeId: z.coerce.number().int(),
-            start: z.string().describe("ISO 8601 new start time"),
-            end: z.string().optional(),
-            timeZone: z.string(),
-            name: z.string().describe("Attendee name"),
-            email: z.string().describe("Attendee email"),
+            start: isoDateTime,
+            end: isoDateTime.optional(),
+            timezone,
+            name: z.string(),
+            email: z.string(),
             guests: z.array(z.string()).optional(),
             notes: z.string().optional(),
             location: z.string().optional(),
             rescheduleReason: z.string().optional(),
-            additionalResponses: z
-                .record(z.string(), z.unknown())
-                .optional()
-                .describe(
-                    "Answers to the event type's own custom booking questions, keyed by each question's " +
-                        "field name from eventType.bookingFields (getEventTypeById).",
-                ),
+            additionalResponses: z.record(z.string(), z.unknown()).optional(),
             language: z.string().default("en"),
             metadata: z.record(z.string(), z.string()).default({}),
         }),
-        handler: async (
-            {
-                rescheduleUid,
-                eventTypeId,
-                start,
-                end,
-                timeZone,
-                name,
-                email,
-                guests,
-                notes,
-                location,
-                rescheduleReason,
-                additionalResponses,
-                language,
-                metadata,
-            },
-            accessToken,
-        ) => {
-            try {
-                return ok(
-                    await callLunacalMcpApi("/bookings/create", accessToken, {
-                        rescheduleUid,
-                        eventTypeId,
-                        start,
-                        end,
-                        timeZone,
-                        language,
-                        metadata,
-                        responses: buildBookingResponses({
-                            name,
-                            email,
-                            guests,
-                            notes,
-                            location,
-                            rescheduleReason,
-                            additionalResponses,
-                        }),
-                        bookingUids: [],
-                        slots: [],
+        handler: async (args, ctx) => {
+            const payload = await withLunacal(ctx, false, (token) =>
+                callLunacalMcpApi("/bookings/create", token, {
+                    rescheduleUid: args.rescheduleUid,
+                    eventTypeId: args.eventTypeId,
+                    start: args.start,
+                    end: args.end,
+                    timeZone: args.timezone,
+                    language: args.language,
+                    metadata: args.metadata,
+                    responses: buildBookingResponses({
+                        name: args.name as string,
+                        email: args.email as string,
+                        guests: args.guests as string[] | undefined,
+                        notes: args.notes as string | undefined,
+                        location: args.location as string | undefined,
+                        rescheduleReason: args.rescheduleReason as string | undefined,
+                        additionalResponses: args.additionalResponses as Record<string, unknown> | undefined,
                     }),
-                );
-            } catch (e) {
-                return err(e);
-            }
+                    bookingUids: [],
+                    slots: [],
+                }),
+            );
+            return textResult(slimBooking(payload));
         },
     },
-
     {
-        name: "cancelBooking",
+        name: "cancel_booking",
         title: "Cancel booking",
-        annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
-        description: "Cancel a booking by its uid. The underlying schema requires uid, not the numeric booking id.",
+        description:
+            "Cancel a booking by uid (not the numeric id). Confirm with the user first. " +
+            "This cannot be undone. If Lunacal requires a reason, pass cancellationReason.",
+        readOnly: false,
+        destructive: true,
         inputSchema: z.object({
             uid: z.string().describe("Booking uid"),
-            allRemainingBookings: z.boolean().optional(),
             cancellationReason: z.string().optional(),
+            allRemainingBookings: z.boolean().optional().describe("Also cancel the rest of a recurring series"),
         }),
-        handler: async ({ uid, allRemainingBookings, cancellationReason }, accessToken) => {
-            try {
-                return ok(
-                    await callLunacalMcpApi("/bookings/cancel", accessToken, {
-                        uid,
-                        allRemainingBookings,
-                        cancellationReason,
-                    }),
-                );
-            } catch (e) {
-                return err(e);
-            }
+        handler: async (args, ctx) => {
+            const payload = await withLunacal(ctx, false, (token) =>
+                callLunacalMcpApi("/bookings/cancel", token, {
+                    uid: args.uid,
+                    cancellationReason: args.cancellationReason,
+                    allRemainingBookings: args.allRemainingBookings,
+                }),
+            );
+            return textResult(payload);
         },
     },
-
     {
-        name: "getEventTypes",
-        title: "List event types",
-        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-        description: "List the authenticated user's Lunacal event types (across their personal and team profiles).",
-        inputSchema: z.object({
-            teamIds: z.array(z.coerce.number().int()).optional(),
-            slug: z.string().optional().describe("Client-side filter applied after fetching"),
-        }),
-        handler: async ({ teamIds, slug }, accessToken) => {
-            try {
-                const res = await callLunacalMcpApi<{
-                    eventTypeGroups: { teamId: number | null; eventTypes: { slug: string }[] }[];
-                }>("/event-types/list", accessToken, teamIds ? { filters: { teamIds } } : undefined);
-                const eventTypes = res.eventTypeGroups.flatMap((g) => g.eventTypes);
-                return ok(slug ? eventTypes.filter((et) => et.slug === slug) : eventTypes);
-            } catch (e) {
-                return err(e);
-            }
-        },
-    },
-
-    {
-        name: "getEventTypeById",
-        title: "Get event type",
-        annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-        description: "Get a single Lunacal event type by its numeric id, including team members and location options.",
-        inputSchema: z.object({
-            id: z.coerce.number().int(),
-        }),
-        handler: async ({ id }, accessToken) => {
-            try {
-                return ok(await callLunacalMcpApi("/event-types/get", accessToken, { id }));
-            } catch (e) {
-                return err(e);
-            }
-        },
-    },
-
-    {
-        name: "createEventType",
+        name: "create_event_type",
         title: "Create event type",
-        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
-        description:
-            "Create a new Lunacal event type with the specified fields. To enable Stripe payments, set " +
-            "metadata.apps.stripe with enabled, price (in the currency's smallest unit), currency, and " +
-            "credentialId (copy from an existing event type's metadata via getEventTypeById).",
-        inputSchema: z.object({
-            title: z.string().min(1),
-            slug: z.string().min(1),
-            length: z.coerce.number().int().describe("Duration in minutes"),
-            description: z.string().optional(),
-            hidden: z.boolean().optional(),
-            teamId: z.coerce.number().int().optional().describe("Required together with schedulingType for a team event"),
-            schedulingType: z.enum(["ROUND_ROBIN", "COLLECTIVE", "MANAGED"]).optional(),
-            minimumBookingNotice: z.coerce.number().int().min(0).optional(),
-            beforeEventBuffer: z.coerce.number().int().min(0).optional(),
-            afterEventBuffer: z.coerce.number().int().min(0).optional(),
-            isPublished: z.boolean().optional(),
-            seatsPerTimeSlot: z.coerce.number().int().nullable().optional().describe("Enables seats when set"),
-            seatsShowAttendees: z.boolean().nullable().optional(),
-            disableGuests: z.boolean().optional(),
-            requiresConfirmation: z.boolean().optional(),
-            successRedirectUrl: z.string().optional(),
-            locations: z.array(z.record(z.string(), z.unknown())).optional(),
-            bookingFields: z.array(z.record(z.string(), z.unknown())).optional(),
-            metadata: z
-                .record(z.string(), z.unknown())
-                .optional()
-                .describe("e.g. { apps: { stripe: { enabled, price, currency, credentialId } } }"),
-        }).loose(),
-        handler: async (body, accessToken) => {
-            try {
-                return ok(await callLunacalMcpApi("/event-types/create", accessToken, body));
-            } catch (e) {
-                return err(e);
-            }
+        description: "Create an event type the user owns. length is the duration in minutes.",
+        readOnly: false,
+        destructive: false,
+        inputSchema: z
+            .object({
+                title: z.string().min(1),
+                slug: z.string().min(1),
+                length: z.coerce.number().int().describe("Duration in minutes"),
+                description: z.string().optional(),
+                hidden: z.boolean().optional(),
+                teamId: z.coerce.number().int().optional(),
+                schedulingType: z.enum(["ROUND_ROBIN", "COLLECTIVE", "MANAGED"]).optional(),
+                locations: z.array(z.record(z.string(), z.unknown())).optional(),
+                bookingFields: z.array(z.record(z.string(), z.unknown())).optional(),
+                metadata: z.record(z.string(), z.unknown()).optional(),
+            })
+            .loose(),
+        handler: async (args, ctx) => {
+            const payload = await withLunacal(ctx, false, (token) => callLunacalMcpApi("/event-types/create", token, args));
+            return textResult(slimEventType(payload));
         },
     },
-
     {
-        name: "updateEventType",
+        name: "update_event_type",
         title: "Update event type",
-        annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
         description:
-            "Update fields on an existing Lunacal event type. Note: metadata, locations, and bookingFields " +
-            "are replaced wholesale — call getEventTypeById first if you only want to change one part. " +
-            "To toggle Stripe payments, set metadata.apps.stripe: {enabled, price, currency, credentialId}. " +
-            "The response reflects the state before this update — call getEventTypeById afterward for fresh state.",
-        inputSchema: z.object({
-            id: z.coerce.number().int(),
-            title: z.string().optional(),
-            description: z.string().optional(),
-            slug: z.string().optional(),
-            length: z.coerce.number().int().optional().describe("Duration in minutes"),
-            hidden: z.boolean().optional(),
-            price: z.coerce.number().optional(),
-            currency: z.string().optional(),
-            minimumBookingNotice: z.coerce.number().int().optional(),
-            beforeEventBuffer: z.coerce.number().int().optional(),
-            afterEventBuffer: z.coerce.number().int().optional(),
-            scheduleId: z.coerce.number().int().nullable().optional(),
-            isPublished: z.boolean().optional(),
-            hashedLink: z.string().optional(),
-            seatsPerTimeSlot: z.coerce.number().int().nullable().optional().describe("Set null to disable seats"),
-            seatsShowAttendees: z.boolean().nullable().optional(),
-            disableGuests: z.boolean().optional(),
-            requiresConfirmation: z.boolean().optional(),
-            successRedirectUrl: z.string().optional(),
-            minSlotsPerPackage: z.coerce.number().int().min(1).nullable().optional(),
-            maxSlotsPerPackage: z.coerce.number().int().min(1).nullable().optional(),
-            locations: z.array(z.record(z.string(), z.unknown())).optional().describe("Replaces all locations wholesale"),
-            bookingFields: z
-                .array(z.record(z.string(), z.unknown()))
-                .optional()
-                .describe("Replaces all custom booking fields wholesale"),
-            metadata: z
-                .record(z.string(), z.unknown())
-                .optional()
-                .describe("Replaces the whole metadata object — e.g. { apps: { stripe: { enabled, price, currency, credentialId } } }"),
-        }).loose(),
-        handler: async ({ id, ...body }, accessToken) => {
-            try {
-                return ok(await callLunacalMcpApi("/event-types/update", accessToken, { id, ...body }));
-            } catch (e) {
-                return err(e);
-            }
+            "Update an event type. metadata, locations, and bookingFields replace the whole value, " +
+            "so read get_event_type first when changing only part of them.",
+        readOnly: false,
+        destructive: false,
+        inputSchema: z
+            .object({
+                id: z.coerce.number().int(),
+                title: z.string().optional(),
+                description: z.string().optional(),
+                slug: z.string().optional(),
+                length: z.coerce.number().int().optional().describe("Duration in minutes"),
+                locations: z.array(z.record(z.string(), z.unknown())).optional(),
+                bookingFields: z.array(z.record(z.string(), z.unknown())).optional(),
+                metadata: z.record(z.string(), z.unknown()).optional(),
+            })
+            .loose(),
+        handler: async (args, ctx) => {
+            const payload = await withLunacal(ctx, false, (token) => callLunacalMcpApi("/event-types/update", token, args));
+            return textResult(slimEventType(payload));
         },
     },
-
-    // {
-    //     name: "deleteEventType",
-    //     title: "Delete event type",
-    //     description: "Delete a Lunacal event type by its numeric id.",
-    //     inputSchema: z.object({
-    //         id: z.coerce.number().int(),
-    //     }),
-    //     handler: async ({ id }, accessToken) => {
-    //         try {
-    //             return ok(await callLunacalMcpApi("/event-types/delete", accessToken, { id }));
-    //         } catch (e) {
-    //             return err(e);
-    //         }
-    //     },
-    // },
-
     {
-        name: "switchEventTypePublished",
-        title: "Publish/unpublish event type",
-        annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
-        description: "Toggle whether a Lunacal event type is published (bookable) or not.",
+        name: "set_event_type_published",
+        title: "Publish or unpublish event type",
+        description: "Set whether an event type is published (bookable) or hidden from the public booking page.",
+        readOnly: false,
+        destructive: false,
         inputSchema: z.object({
             eventId: z.coerce.number().int(),
             isPublished: z.boolean(),
             teamId: z.coerce.number().int().optional(),
         }),
-        handler: async ({ eventId, isPublished, teamId }, accessToken) => {
-            try {
-                return ok(
-                    await callLunacalMcpApi("/event-types/switch-published", accessToken, {
-                        eventId,
-                        isPublished,
-                        teamId,
-                    }),
-                );
-            } catch (e) {
-                return err(e);
-            }
+        handler: async (args, ctx) => {
+            const payload = await withLunacal(ctx, false, (token) =>
+                callLunacalMcpApi("/event-types/switch-published", token, args),
+            );
+            return textResult(payload);
         },
     },
 ];
 
-/**
- * Registers every entry in lunacalTools on a fresh McpServer instance (called
- * once per request — see server/index.ts). oauthAccessToken is the caller's
- * own Lunacal access token, resolved from their OAuth login via
- * oauthBroker.ts; every tool call requires one.
- */
-export function registerLunacalTools(server: McpServer, oauthAccessToken?: string): void {
-    for (const tool of lunacalTools) {
+export function registerLunacalTools(server: McpServer, auth?: AuthInfo): void {
+    const accessToken = auth?.token;
+    const grantId = typeof auth?.extra?.grantId === "string" ? auth.extra.grantId : undefined;
+    for (const tool of tools) {
         server.registerTool(
             tool.name,
-            { title: tool.title, description: tool.description, inputSchema: tool.inputSchema, annotations: tool.annotations },
-            (args) => {
-                if (!oauthAccessToken) {
-                    return Promise.resolve(err(new Error("Not authenticated — complete the OAuth login flow first")));
+            {
+                title: tool.title,
+                description: tool.description,
+                inputSchema: tool.inputSchema,
+                annotations: {
+                    readOnlyHint: tool.readOnly,
+                    destructiveHint: tool.destructive,
+                    idempotentHint: tool.readOnly,
+                    openWorldHint: !tool.readOnly,
+                },
+            },
+            async (args) => {
+                if (!accessToken || !grantId) {
+                    return textResult("Not authenticated. Complete the OAuth login flow first.", true);
                 }
-                return tool.handler(args, oauthAccessToken);
+                try {
+                    return await tool.handler((args ?? {}) as Record<string, unknown>, { accessToken, grantId });
+                } catch (err) {
+                    return fail(err);
+                }
             },
         );
     }

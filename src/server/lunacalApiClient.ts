@@ -1,25 +1,19 @@
-const DEFAULT_WEBAPP_URL = "https://app.lunacal.ai";
+import { config } from "./config.js";
 
 export class LunacalApiError extends Error {
     constructor(
         public readonly status: number,
         public readonly body: unknown,
     ) {
-        super(`Lunacal API error ${status}: ${JSON.stringify(body)}`);
+        super(`Lunacal API error ${status}`);
+        this.name = "LunacalApiError";
     }
 }
 
 export function getWebappUrl(): string {
-    return process.env.LUNACAL_WEBAPP_URL ?? DEFAULT_WEBAPP_URL;
+    return config.lunacalWebappUrl;
 }
 
-/**
- * Calls one of lunacal-mcp's dedicated routes on the Lunacal webapp itself
- * (apps/web/pages/api/mcp/*), which internally call the same tRPC procedures
- * and booking handlers the app's own UI uses — there is no separate REST API
- * (apps/api/v1/v2 exist in that repo's source but are never deployed).
- * Every call needs the per-user OAuth access token from oauthBroker.ts.
- */
 export async function callLunacalMcpApi<T = unknown>(
     path: string,
     accessToken: string,
@@ -33,10 +27,18 @@ export async function callLunacalMcpApi<T = unknown>(
             Authorization: `Bearer ${accessToken}`,
         },
         body: JSON.stringify(body ?? {}),
+        signal: AbortSignal.timeout(20_000),
     });
 
     const text = await res.text();
-    const data = text ? JSON.parse(text) : undefined;
+    let data: unknown;
+    if (text) {
+        try {
+            data = JSON.parse(text) as unknown;
+        } catch {
+            data = { message: "Lunacal returned a non-JSON response" };
+        }
+    }
 
     if (!res.ok) {
         throw new LunacalApiError(res.status, data);

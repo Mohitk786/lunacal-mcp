@@ -14,6 +14,7 @@ ENV NODE_ENV=production
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 COPY --from=build /app/build ./build
+COPY migrations ./migrations
 
 # Azure App Service (Linux, custom container) routes traffic to the port named
 # by the WEBSITES_PORT app setting; set that app setting to match this PORT.

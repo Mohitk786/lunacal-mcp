@@ -223,6 +223,14 @@ const server = createServer(async (req, res) => {
             return;
         }
 
+        if (url.pathname === "/.well-known/glama.json" && req.method === "GET") {
+            sendJson(res, 200, {
+                $schema: "https://glama.ai/mcp/schemas/connector.json",
+                claim: "glama_claim_x5fa0852UMLabXZ-idF5OZ1TX9XU_8Z3",
+            });
+            return;
+        }
+
         const ip = clientIp(req);
         const bearer = req.headers.authorization?.startsWith("Bearer ")
             ? req.headers.authorization.slice("Bearer ".length)

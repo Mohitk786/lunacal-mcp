@@ -416,10 +416,11 @@ const tools: ToolDef[] = [
         name: "reschedule_booking",
         title: "Reschedule booking",
         description:
-            "Move an existing booking to a new start time. Call find_available_slots with rescheduleUid first. " +
+            "Move an existing booking to a new start time. The previous time is released and attendees are moved, which is hard to undo. " +
+            "Call find_available_slots with rescheduleUid first. " +
             "Requires the booking uid from list_bookings, the event type id, and the attendee name and email.",
         readOnly: false,
-        destructive: false,
+        destructive: true,
         inputSchema: z.object({
             rescheduleUid: z.string().describe("uid of the booking to move"),
             eventTypeId: z.coerce.number().int(),
@@ -516,9 +517,9 @@ const tools: ToolDef[] = [
         title: "Update event type",
         description:
             "Update an event type. metadata, locations, and bookingFields replace the whole value, " +
-            "so read get_event_type first when changing only part of them.",
+            "so omitted items in those fields are removed. Read get_event_type first when changing only part of them.",
         readOnly: false,
-        destructive: false,
+        destructive: true,
         inputSchema: z
             .object({
                 id: z.coerce.number().int(),
@@ -570,7 +571,7 @@ export function registerLunacalTools(server: McpServer, auth?: AuthInfo): void {
                     readOnlyHint: tool.readOnly,
                     destructiveHint: tool.destructive,
                     idempotentHint: tool.readOnly,
-                    openWorldHint: !tool.readOnly,
+                    openWorldHint: false,
                 },
             },
             async (args) => {

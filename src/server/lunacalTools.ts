@@ -231,6 +231,7 @@ type ToolDef = {
     inputSchema: z.ZodType;
     readOnly: boolean;
     destructive: boolean;
+    openWorld?: boolean;
     handler: (args: Record<string, unknown>, ctx: ToolCtx) => Promise<ToolResult>;
 };
 
@@ -540,9 +541,10 @@ const tools: ToolDef[] = [
     {
         name: "set_event_type_published",
         title: "Publish or unpublish event type",
-        description: "Set whether an event type is published (bookable) or hidden from the public booking page.",
+        description: "Publish an event type on its public booking page, or hide it from that page.",
         readOnly: false,
         destructive: false,
+        openWorld: true,
         inputSchema: z.object({
             eventId: z.coerce.number().int(),
             isPublished: z.boolean(),
@@ -571,7 +573,7 @@ export function registerLunacalTools(server: McpServer, auth?: AuthInfo): void {
                     readOnlyHint: tool.readOnly,
                     destructiveHint: tool.destructive,
                     idempotentHint: tool.readOnly,
-                    openWorldHint: false,
+                    openWorldHint: tool.openWorld === true,
                 },
             },
             async (args) => {

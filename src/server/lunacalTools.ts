@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { AuthInfo, McpServer } from "@modelcontextprotocol/server";
-import { callLunacalMcpApi, LunacalApiError } from "./lunacalApiClient.js";
+import { callLunacalApi, LunacalApiError } from "./lunacalApiClient.js";
 import { lunacalAccessForGrant } from "./lunacalSession.js";
 import { GrantDeadError, UpstreamTemporaryError } from "./oauthErrors.js";
 import { requestStore } from "./requestContext.js";
@@ -245,7 +245,7 @@ const tools: ToolDef[] = [
         destructive: false,
         inputSchema: z.object({}),
         handler: async (_args, ctx) => {
-            const profile = await withLunacal(ctx, true, (token) => callLunacalMcpApi("/me", token, {}));
+            const profile = await withLunacal(ctx, true, (token) => callLunacalApi("/user/me", token, {}));
             return textResult(slimProfile(profile));
         },
     },
@@ -265,7 +265,7 @@ const tools: ToolDef[] = [
             const teamIds = args.teamIds as number[] | undefined;
             const slug = args.slug as string | undefined;
             const payload = await withLunacal(ctx, true, (token) =>
-                callLunacalMcpApi("/event-types/list", token, teamIds ? { filters: { teamIds } } : {}),
+                callLunacalApi("/event-types/list", token, teamIds ? { filters: { teamIds } } : {}),
             );
             const eventTypes = flattenEventTypes(payload);
             if (!Array.isArray(eventTypes) || !slug) return textResult(eventTypes);
@@ -283,7 +283,7 @@ const tools: ToolDef[] = [
         inputSchema: z.object({ id: z.coerce.number().int() }),
         handler: async (args, ctx) => {
             const payload = await withLunacal(ctx, true, (token) =>
-                callLunacalMcpApi("/event-types/get", token, { id: args.id }),
+                callLunacalApi("/event-types/get", token, { id: args.id }),
             );
             return textResult(slimEventType(payload));
         },
@@ -309,7 +309,7 @@ const tools: ToolDef[] = [
         }),
         handler: async (args, ctx) => {
             const payload = await withLunacal(ctx, true, (token) =>
-                callLunacalMcpApi("/get-availability", token, {
+                callLunacalApi("/availability", token, {
                     startTime: args.startTime,
                     endTime: args.endTime,
                     timeZone: args.timezone,
@@ -345,7 +345,7 @@ const tools: ToolDef[] = [
         }),
         handler: async (args, ctx) => {
             const payload = await withLunacal(ctx, true, (token) =>
-                callLunacalMcpApi("/bookings/list", token, {
+                callLunacalApi("/bookings/list", token, {
                     filters: {
                         status: args.status,
                         teamIds: args.teamIds,
@@ -390,7 +390,7 @@ const tools: ToolDef[] = [
         }),
         handler: async (args, ctx) => {
             const payload = await withLunacal(ctx, false, (token) =>
-                callLunacalMcpApi("/bookings/create", token, {
+                callLunacalApi("/bookings/create", token, {
                     eventTypeId: args.eventTypeId,
                     start: args.start,
                     end: args.end,
@@ -438,7 +438,7 @@ const tools: ToolDef[] = [
         }),
         handler: async (args, ctx) => {
             const payload = await withLunacal(ctx, false, (token) =>
-                callLunacalMcpApi("/bookings/create", token, {
+                callLunacalApi("/bookings/create", token, {
                     rescheduleUid: args.rescheduleUid,
                     eventTypeId: args.eventTypeId,
                     start: args.start,
@@ -477,7 +477,7 @@ const tools: ToolDef[] = [
         }),
         handler: async (args, ctx) => {
             const payload = await withLunacal(ctx, false, (token) =>
-                callLunacalMcpApi("/bookings/cancel", token, {
+                callLunacalApi("/bookings/cancel", token, {
                     uid: args.uid,
                     cancellationReason: args.cancellationReason,
                     allRemainingBookings: args.allRemainingBookings,
@@ -507,7 +507,7 @@ const tools: ToolDef[] = [
             })
             .loose(),
         handler: async (args, ctx) => {
-            const payload = await withLunacal(ctx, false, (token) => callLunacalMcpApi("/event-types/create", token, args));
+            const payload = await withLunacal(ctx, false, (token) => callLunacalApi("/event-types/create", token, args));
             return textResult(slimEventType(payload));
         },
     },
@@ -532,7 +532,7 @@ const tools: ToolDef[] = [
             })
             .loose(),
         handler: async (args, ctx) => {
-            const payload = await withLunacal(ctx, false, (token) => callLunacalMcpApi("/event-types/update", token, args));
+            const payload = await withLunacal(ctx, false, (token) => callLunacalApi("/event-types/update", token, args));
             return textResult(slimEventType(payload));
         },
     },
@@ -549,7 +549,7 @@ const tools: ToolDef[] = [
         }),
         handler: async (args, ctx) => {
             const payload = await withLunacal(ctx, false, (token) =>
-                callLunacalMcpApi("/event-types/switch-published", token, args),
+                callLunacalApi("/event-types/switch-published", token, args),
             );
             return textResult(payload);
         },

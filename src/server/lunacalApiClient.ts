@@ -14,12 +14,12 @@ export function getWebappUrl(): string {
     return config.lunacalWebappUrl;
 }
 
-export async function callLunacalMcpApi<T = unknown>(
+export async function callLunacalApi<T = unknown>(
     path: string,
     accessToken: string,
     body?: unknown,
 ): Promise<T> {
-    const url = `${getWebappUrl()}/api/mcp${path}`;
+    const url = `${getWebappUrl()}/api${path}`;
     const res = await fetch(url, {
         method: "POST",
         headers: {

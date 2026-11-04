@@ -224,13 +224,19 @@ function slimProfile(payload: unknown): unknown {
     return Object.values(picked).some((value) => value !== undefined) ? picked : payload;
 }
 
+type ToolAnnotations = {
+    readOnlyHint: boolean;
+    destructiveHint: boolean;
+    idempotentHint: boolean;
+    openWorldHint: boolean;
+};
+
 type ToolDef = {
     name: string;
     title: string;
     description: string;
     inputSchema: z.ZodType;
-    readOnly: boolean;
-    destructive: boolean;
+    annotations: ToolAnnotations;
     handler: (args: Record<string, unknown>, ctx: ToolCtx) => Promise<ToolResult>;
 };
 
@@ -240,9 +246,8 @@ const tools: ToolDef[] = [
         title: "Get my profile",
         description:
             "Get the signed-in user's Lunacal profile: name, email, username, and timezone. " +
-            "Call this when you need the user's timezone before searching for slots.",
-        readOnly: true,
-        destructive: false,
+            "Call this when you need the user's timezone before searching for slots. Reads the signed-in account only.",
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
         inputSchema: z.object({}),
         handler: async (_args, ctx) => {
             const profile = await withLunacal(ctx, true, (token) => callLunacalApi("/user/me", token, {}));
@@ -254,9 +259,8 @@ const tools: ToolDef[] = [
         title: "List event types",
         description:
             "List the user's event types (personal and team). Use an id from this list with find_available_slots " +
-            "and create_booking. scheduleId is informational; weekly hours cannot be edited with this server.",
-        readOnly: true,
-        destructive: false,
+            "and create_booking. scheduleId is informational; weekly hours cannot be edited with this server. Read-only.",
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
         inputSchema: z.object({
             teamIds: z.array(z.coerce.number().int()).optional(),
             slug: z.string().optional().describe("Keep only event types with this slug"),
@@ -277,9 +281,8 @@ const tools: ToolDef[] = [
         title: "Get event type",
         description:
             "Get one event type by numeric id, including locations and bookingFields. " +
-            "Required booking questions must be answered in create_booking additionalResponses, keyed by field name.",
-        readOnly: true,
-        destructive: false,
+            "Required booking questions must be answered in create_booking additionalResponses, keyed by field name. Read-only.",
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
         inputSchema: z.object({ id: z.coerce.number().int() }),
         handler: async (args, ctx) => {
             const payload = await withLunacal(ctx, true, (token) =>
@@ -294,9 +297,9 @@ const tools: ToolDef[] = [
         description:
             "Find open booking slots for an event type between start and end. " +
             "Call this before create_booking or reschedule_booking. Identify the event type by eventTypeId, " +
-            "or by eventTypeSlug plus usernameList. Times must include a timezone offset, and timezone is required.",
-        readOnly: true,
-        destructive: false,
+            "or by eventTypeSlug plus usernameList. Times must include a timezone offset, and timezone is required. " +
+            "This only returns slots. It does not book or notify anyone.",
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
         inputSchema: z.object({
             startTime: isoDateTime.describe("Range start"),
             endTime: isoDateTime.describe("Range end"),
@@ -328,9 +331,8 @@ const tools: ToolDef[] = [
         title: "List bookings",
         description:
             "List the user's bookings. status is required. Pass limit (default 20, max 100) and cursor from a " +
-            "previous nextCursor for the next page. Use a booking uid from this list to reschedule or cancel.",
-        readOnly: true,
-        destructive: false,
+            "previous nextCursor for the next page. Use a booking uid from this list to reschedule or cancel. Read-only.",
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
         inputSchema: z.object({
             status: z.enum(["upcoming", "recurring", "past", "cancelled", "unconfirmed"]),
             timezone: timezone.optional().describe("How to interpret startDate and endDate when they are local times"),
@@ -368,9 +370,9 @@ const tools: ToolDef[] = [
         description:
             "Book a slot on an event type. Call find_available_slots first and pass one of those start times. " +
             "If the event type has required bookingFields from get_event_type, put the answers in additionalResponses " +
-            "keyed by each field's name. This does not check availability itself.",
-        readOnly: false,
-        destructive: false,
+            "keyed by each field's name. This does not check availability itself. Lunacal emails the attendee and " +
+            "any guests, and that notice cannot be unsent. Calling this again can create a second booking.",
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
         inputSchema: z.object({
             eventTypeId: z.coerce.number().int(),
             start: isoDateTime,
@@ -417,9 +419,9 @@ const tools: ToolDef[] = [
         title: "Reschedule booking",
         description:
             "Move an existing booking to a new start time. Call find_available_slots with rescheduleUid first. " +
-            "Requires the booking uid from list_bookings, the event type id, and the attendee name and email.",
-        readOnly: false,
-        destructive: false,
+            "Requires the booking uid from list_bookings, the event type id, and the attendee name and email. " +
+            "This overwrites the current time and Lunacal emails the attendee. Confirm with the user before calling.",
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
         inputSchema: z.object({
             rescheduleUid: z.string().describe("uid of the booking to move"),
             eventTypeId: z.coerce.number().int(),
@@ -467,9 +469,9 @@ const tools: ToolDef[] = [
         title: "Cancel booking",
         description:
             "Cancel a booking by uid (not the numeric id). Confirm with the user first. " +
-            "This cannot be undone. If Lunacal requires a reason, pass cancellationReason.",
-        readOnly: false,
-        destructive: true,
+            "This cannot be undone, and Lunacal emails the attendees. allRemainingBookings also cancels the rest " +
+            "of a recurring series. If Lunacal requires a reason, pass cancellationReason.",
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
         inputSchema: z.object({
             uid: z.string().describe("Booking uid"),
             cancellationReason: z.string().optional(),
@@ -489,9 +491,11 @@ const tools: ToolDef[] = [
     {
         name: "create_event_type",
         title: "Create event type",
-        description: "Create an event type the user owns. length is the duration in minutes.",
-        readOnly: false,
-        destructive: false,
+        description:
+            "Add an event type on the signed-in account. length is the duration in minutes. " +
+            "This does not delete or replace an existing event type and does not email anyone. " +
+            "Use set_event_type_published to show or hide it on the public booking page.",
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
         inputSchema: z
             .object({
                 title: z.string().min(1),
@@ -515,10 +519,10 @@ const tools: ToolDef[] = [
         name: "update_event_type",
         title: "Update event type",
         description:
-            "Update an event type. metadata, locations, and bookingFields replace the whole value, " +
-            "so read get_event_type first when changing only part of them.",
-        readOnly: false,
-        destructive: false,
+            "Update an event type on the signed-in account. metadata, locations, and bookingFields replace " +
+            "the whole stored value, so read get_event_type first when changing only part of them. " +
+            "That replacement is an overwrite. Confirm with the user before calling. This does not email anyone.",
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
         inputSchema: z
             .object({
                 id: z.coerce.number().int(),
@@ -539,9 +543,10 @@ const tools: ToolDef[] = [
     {
         name: "set_event_type_published",
         title: "Publish or unpublish event type",
-        description: "Set whether an event type is published (bookable) or hidden from the public booking page.",
-        readOnly: false,
-        destructive: false,
+        description:
+            "Show or hide an event type on the public booking page. Hiding it revokes public booking access. " +
+            "Confirm with the user before hiding. Setting the same value again does not change anything further.",
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
         inputSchema: z.object({
             eventId: z.coerce.number().int(),
             isPublished: z.boolean(),
@@ -566,12 +571,7 @@ export function registerLunacalTools(server: McpServer, auth?: AuthInfo): void {
                 title: tool.title,
                 description: tool.description,
                 inputSchema: tool.inputSchema,
-                annotations: {
-                    readOnlyHint: tool.readOnly,
-                    destructiveHint: tool.destructive,
-                    idempotentHint: tool.readOnly,
-                    openWorldHint: !tool.readOnly,
-                },
+                annotations: tool.annotations,
             },
             async (args) => {
                 if (!accessToken || !grantId) {

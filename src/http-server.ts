@@ -1,42 +1,24 @@
-#!/usr/bin/env node
 import { createServer, type IncomingMessage, type OutgoingHttpHeaders, type ServerResponse } from "node:http";
-import { McpServer, createMcpHandler, type AuthInfo } from "@modelcontextprotocol/server";
-import { toNodeHandler, type NodeIncomingMessageLike } from "@modelcontextprotocol/node";
+import type { AuthInfo } from "@modelcontextprotocol/server";
+import type { NodeIncomingMessageLike } from "@modelcontextprotocol/node";
 import { config } from "./config.js";
-import { sha256 } from "./crypto.js";
-import { checkDb, cleanupExpired, closePool, migrate } from "./db.js";
-import { SERVER_INSTRUCTIONS } from "./instructions.js";
-import { getWebappUrl } from "./lunacalApiClient.js";
-import { registerLunacalTools } from "./lunacalTools.js";
-import { log } from "./log.js";
-import { GrantDeadError, OAuthError, UpstreamTemporaryError } from "./oauthErrors.js";
+import { sha256 } from "./storage/crypto.js";
+import { checkDb, cleanupExpired, closePool } from "./storage/db.js";
+import { log } from "./utils/logger.js";
+import { GrantDeadError, OAuthError, UpstreamTemporaryError } from "./auth/oauth-errors.js";
 import {
     beginAuthorization,
     exchangeToken,
     finishLunacalAuthorization,
     registerMcpClient,
     resolveMcpAccess,
-} from "./oauthBroker.js";
-import { RateLimiter } from "./rateLimit.js";
-import { requestStore, type RequestStore } from "./requestContext.js";
+} from "./auth/oauth-broker.js";
+import { RateLimiter } from "./utils/rate-limiter.js";
+import { requestStore, type RequestStore } from "./auth/context.js";
+import { nodeHandler } from "./server.js";
 
 const MCP_PATH = "/mcp";
 const MAX_BODY_BYTES = 1024 * 1024;
-
-const handler = createMcpHandler((ctx) => {
-    const server = new McpServer(
-        {
-            name: "lunacal",
-            version: "1.1.0",
-            icons: [{ src: `${getWebappUrl()}/lunacal-icon.svg`, mimeType: "image/svg+xml" }],
-        },
-        { instructions: SERVER_INSTRUCTIONS },
-    );
-    registerLunacalTools(server, ctx.authInfo);
-    return server;
-});
-
-const nodeHandler = toNodeHandler(handler);
 
 const rateLimiters = {
     general: new RateLimiter(config.oauthRateLimitMax, 60_000),
@@ -358,13 +340,8 @@ function shutdown(signal: string): void {
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
 
-migrate()
-    .then(() => {
-        server.listen(config.port, "0.0.0.0", () => {
-            log.info("listening", { port: config.port, publicBaseUrl: config.publicBaseUrl });
-        });
-    })
-    .catch((err: unknown) => {
-        log.error("startup failed", { message: err instanceof Error ? err.message : "unknown" });
-        process.exit(1);
+export function startHttpServer(): void {
+    server.listen(config.port, "0.0.0.0", () => {
+        log.info("listening", { port: config.port, publicBaseUrl: config.publicBaseUrl });
     });
+}

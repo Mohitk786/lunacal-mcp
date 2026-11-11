@@ -1,8 +1,8 @@
-import { config } from "./config.js";
-import { exchangeLunacalCode } from "./lunacalOAuth.js";
-import { log } from "./log.js";
-import { lunacalAccessForGrant } from "./lunacalSession.js";
-import { OAuthError } from "./oauthErrors.js";
+import { config } from "../config.js";
+import { exchangeLunacalCode } from "./lunacal-oauth.js";
+import { log } from "../utils/logger.js";
+import { lunacalAccessForGrant } from "./lunacal-session.js";
+import { OAuthError } from "./oauth-errors.js";
 import {
     consumePending,
     getClient,
@@ -14,7 +14,7 @@ import {
     redeemAuthCode,
     rotateRefreshToken,
     type IssuedTokens,
-} from "./oauthStore.js";
+} from "./oauth-store.js";
 
 const BLOCKED_SCHEMES = new Set(["javascript:", "data:", "file:", "vbscript:", "blob:"]);
 const MAX_REDIRECT_URIS = 10;

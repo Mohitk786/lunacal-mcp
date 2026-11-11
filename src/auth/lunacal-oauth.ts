@@ -1,5 +1,5 @@
-import { config } from "./config.js";
-import { log } from "./log.js";
+import { config } from "../config.js";
+import { log } from "../utils/logger.js";
 
 export type LunacalTokenSet = {
     accessToken: string;

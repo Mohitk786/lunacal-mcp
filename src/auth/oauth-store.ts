@@ -5,11 +5,11 @@ import {
     PENDING_AUTH_TTL_MS,
     REFRESH_GRACE_MS,
     REFRESH_TOKEN_TTL_MS,
-} from "./config.js";
-import { decrypt, encrypt, randomToken, sha256, verifyPkce } from "./crypto.js";
-import { pool, type DbClient } from "./db.js";
-import { log } from "./log.js";
-import { OAuthError } from "./oauthErrors.js";
+} from "../config.js";
+import { decrypt, encrypt, randomToken, sha256, verifyPkce } from "../storage/crypto.js";
+import { pool, type DbClient } from "../storage/db.js";
+import { log } from "../utils/logger.js";
+import { OAuthError } from "./oauth-errors.js";
 
 export type RegisteredClient = {
     clientId: string;

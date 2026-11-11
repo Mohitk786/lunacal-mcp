@@ -1,5 +1,5 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { config } from "./config.js";
+import { config } from "../config.js";
 
 const IV_LENGTH = 12;
 const TAG_LENGTH = 16;

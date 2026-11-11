@@ -2,8 +2,8 @@ import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
-import { config } from "./config.js";
-import { log } from "./log.js";
+import { config } from "../config.js";
+import { log } from "../utils/logger.js";
 
 const { Pool } = pg;
 

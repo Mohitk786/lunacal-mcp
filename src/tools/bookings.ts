@@ -200,4 +200,55 @@ export const tools: ToolDef[] = [
             return textResult(payload);
         },
     },
+    {
+        name: "confirm_booking",
+        title: "Confirm booking",
+        description:
+            "Confirm a pending booking on an event type that requires confirmation. Identify the booking by its " +
+            "numeric bookingId (the id field from list_bookings, not the uid). Only bookings with status " +
+            "'unconfirmed' can be confirmed. Lunacal emails the attendee to confirm the meeting is on. " +
+            "Pass forceConfirm to confirm even when the slot now conflicts with another booking.",
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+        inputSchema: z.object({
+            bookingId: z.coerce.number().int().describe("Numeric booking id from list_bookings (not the uid)"),
+            forceConfirm: z.boolean().optional().describe("Confirm even if the slot now conflicts with another booking"),
+        }),
+        handler: async (args, ctx) => {
+            const payload = await withLunacal(ctx, false, (token) =>
+                callLunacalApi("/bookings/confirm", token, {
+                    bookingId: args.bookingId,
+                    confirmed: true,
+                    forceConfirm: args.forceConfirm,
+                }),
+            );
+            return textResult(payload);
+        },
+    },
+    {
+        name: "decline_booking",
+        title: "Decline booking",
+        description:
+            "Decline (reject) a pending booking on an event type that requires confirmation. Identify the booking " +
+            "by its numeric bookingId (the id field from list_bookings, not the uid). Only bookings with status " +
+            "'unconfirmed' can be declined. Confirm with the user first — this rejects the booking and Lunacal " +
+            "emails the attendee. Pass recurringEventId to decline the whole recurring series, and reason to tell " +
+            "the attendee why.",
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+        inputSchema: z.object({
+            bookingId: z.coerce.number().int().describe("Numeric booking id from list_bookings (not the uid)"),
+            reason: z.string().optional().describe("Reason sent to the attendee for the decline"),
+            recurringEventId: z.string().optional().describe("Decline all future bookings in this recurring series"),
+        }),
+        handler: async (args, ctx) => {
+            const payload = await withLunacal(ctx, false, (token) =>
+                callLunacalApi("/bookings/confirm", token, {
+                    bookingId: args.bookingId,
+                    confirmed: false,
+                    reason: args.reason,
+                    recurringEventId: args.recurringEventId,
+                }),
+            );
+            return textResult(payload);
+        },
+    },
 ];

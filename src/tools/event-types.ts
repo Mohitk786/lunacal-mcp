@@ -48,6 +48,15 @@ function flattenEventTypes(payload: unknown): unknown {
     });
 }
 
+function unwrapEventType(payload: unknown): Record<string, unknown> {
+    if (!payload || typeof payload !== "object") return {};
+    const record = payload as Record<string, unknown>;
+    if (record.id == null && record.eventType && typeof record.eventType === "object") {
+        return record.eventType as Record<string, unknown>;
+    }
+    return record;
+}
+
 export const tools: ToolDef[] = [
     {
         name: "list_event_types",
@@ -111,6 +120,48 @@ export const tools: ToolDef[] = [
         handler: async (args, ctx) => {
             const payload = await withLunacal(ctx, false, (token) => callLunacalApi("/event-types/create", token, args));
             return textResult(slimEventType(payload));
+        },
+    },
+    {
+        name: "duplicate_event_type",
+        title: "Duplicate event type",
+        description:
+            "Clone an existing event type into a new one on the same account or team. Give the source event type's id " +
+            "from list_event_types. By default the copy keeps the source's length and description, and its title and " +
+            "slug get a '(copy)' / '-copy' suffix; pass title, slug, description, or length to override. The new slug " +
+            "must be unique — a collision surfaces as an error, so pass an explicit slug when duplicating more than once. " +
+            "This copies locations, booking fields, limits, hosts, and metadata, but not webhooks or the linked schedule. " +
+            "Does not email anyone.",
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+        inputSchema: z.object({
+            id: z.coerce.number().int().describe("Source event type id to clone (from list_event_types)"),
+            title: z.string().min(1).optional().describe("Title for the copy; defaults to '<source title> (copy)'"),
+            slug: z
+                .string()
+                .min(1)
+                .optional()
+                .describe("URL slug for the copy; defaults to '<source slug>-copy'. Must be unique"),
+            description: z.string().optional().describe("Description for the copy; defaults to the source's"),
+            length: z.coerce.number().int().min(1).optional().describe("Duration in minutes; defaults to the source's"),
+        }),
+        handler: async (args, ctx) => {
+            const id = args.id as number;
+            const source = await withLunacal(ctx, true, (token) =>
+                callLunacalApi("/event-types/get", token, { id }),
+            );
+            const src = unwrapEventType(source);
+            const length = (args.length as number | undefined) ?? (typeof src.length === "number" ? src.length : undefined);
+            if (length == null) {
+                return textResult("Could not read the source event type's duration. Pass length explicitly.", true);
+            }
+            const title = (args.title as string | undefined) ?? `${String(src.title ?? "")} (copy)`;
+            const slug = (args.slug as string | undefined) ?? `${String(src.slug ?? "")}-copy`;
+            const description =
+                (args.description as string | undefined) ?? (typeof src.description === "string" ? src.description : "");
+            const payload = await withLunacal(ctx, false, (token) =>
+                callLunacalApi("/event-types/duplicate", token, { id, title, slug, description, length }),
+            );
+            return textResult(slimEventType(unwrapEventType(payload)));
         },
     },
     {
